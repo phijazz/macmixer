@@ -267,6 +267,8 @@ pub fn input_devices() -> Vec<(String, u16)> {
         let ch = d.default_input_config().ok()?.channels();
         Some((dev_name(&d)?, ch))
     })
+    // MacMixer's own aggregates (virtual device + system output) are for other applications.
+    .filter(|(n, _)| !(n.starts_with(VIRTUAL_PREFIX) && n.contains(" + ")))
     .collect()
 }
 

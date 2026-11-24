@@ -45,7 +45,7 @@ fn addr(sel: AudioObjectPropertySelector) -> AudioObjectPropertyAddress {
 }
 
 /// Lit une propriété de taille fixe. `T` doit être un type C simple.
-unsafe fn get<T>(obj: AudioObjectID, sel: AudioObjectPropertySelector) -> Option<T> {
+pub(crate) unsafe fn get<T>(obj: AudioObjectID, sel: AudioObjectPropertySelector) -> Option<T> {
     let mut v: T = std::mem::zeroed();
     let mut size = std::mem::size_of::<T>() as u32;
     let a = addr(sel);
@@ -175,12 +175,12 @@ impl Drop for TapSource {
     }
 }
 
-unsafe fn dict_set(d: &CFMutableDictionary, key: &CStr, val: *const c_void) {
+pub(crate) unsafe fn dict_set(d: &CFMutableDictionary, key: &CStr, val: *const c_void) {
     let k = CFString::from_str(key.to_str().unwrap());
     CFMutableDictionary::set_value(Some(d), &*k as *const CFString as *const c_void, val);
 }
 
-unsafe fn new_dict() -> CFRetained<CFMutableDictionary> {
+pub(crate) unsafe fn new_dict() -> CFRetained<CFMutableDictionary> {
     CFMutableDictionary::new(
         kCFAllocatorDefault,
         0,

@@ -101,7 +101,11 @@ const PROP_SAMPLE_RATE: u32 = fourcc(b"nsrt");
 
 /// The CoreAudio device of a slot, once the driver has published it.
 fn device(slot: usize) -> Option<AudioObjectID> {
-    let uid = CFString::from_str(&uid(slot));
+    device_by_uid(&uid(slot))
+}
+
+pub fn device_by_uid(uid: &str) -> Option<AudioObjectID> {
+    let uid = CFString::from_str(uid);
     let qualifier: *const CFString = &*uid;
     let a = addr(PROP_UID_TO_DEVICE);
     let mut id: AudioObjectID = 0;

@@ -20,6 +20,11 @@ audio driver required.
   select as its input. This uses MacMixer's own small audio driver; the devices exist
   only while MacMixer is running. They are stereo, 44.1 to 192 kHz: the rate can be set
   in MacMixer's settings, in Audio MIDI Setup or by the application using the device.
+- **Coupled devices**: each virtual device is also published combined with the system
+  output device, as "MacMixer: <output name> + <system output>" (an aggregate device).
+  Applications that can only open one audio device (DAWs, plug-in hosts) use that one:
+  the mixer signal arrives on its last two inputs, the speakers are its first outputs.
+  Can be turned off in the settings.
 - **Settings**: latency (device buffer size), virtual device sample rate and peak
   auto-reset time.
 - Channels grow with the window height.

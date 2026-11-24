@@ -1,5 +1,6 @@
 //! MacMixer — un mixeur façon jack_mixer pour macOS, sur CoreAudio.
 
+mod aggregate;
 mod engine;
 mod tap;
 mod vdev;
@@ -102,6 +103,9 @@ struct Config {
     /// Sample rate given to a virtual device when it is created.
     #[serde(default = "default_vdev_rate")]
     vdev_rate: u32,
+    /// Also publish each virtual device coupled with the system output (aggregate device).
+    #[serde(default = "yes")]
+    couple: bool,
     #[serde(default)]
     buses: Vec<BusCfg>,
     #[serde(default)]
@@ -110,7 +114,7 @@ struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { buffer: 0, peak_auto: true, peak_secs: 5.0, vdev_rate: 48_000, buses: vec![], strips: vec![] }
+        Self { buffer: 0, peak_auto: true, peak_secs: 5.0, vdev_rate: 48_000, couple: true, buses: vec![], strips: vec![] }
     }
 }
 
@@ -163,6 +167,8 @@ struct BusUi {
     vrt: Option<Arc<Bus>>,
     vstream: Option<cpal::Stream>,
     verr: String,
+    /// Aggregate "system output + virtual device", for single-device applications.
+    agg: Option<Aggregate>,
     /// Sample rates the two streams were opened at.
     rate: u32,
     vrate: u32,
@@ -170,6 +176,20 @@ struct BusUi {
     /// MacMixer follows whatever rate the device is set to).
     vrate_set: bool,
     meter: Meter,
+}
+
+struct Aggregate {
+    id: u32,
+    /// (hardware device UID, virtual device name) it was built from.
+    key: (String, String),
+    name: String,
+    hw_name: String,
+}
+
+fn virtual_name(cfg: &BusCfg) -> String {
+    let name = cfg.name.replace(['\n', '\r'], " ");
+    let name = if name.trim().is_empty() { "Output" } else { name.trim() };
+    format!("{VIRTUAL_PREFIX}{name}")
 }
 
 enum Action {
@@ -195,6 +215,7 @@ struct App {
     /// The virtual audio driver's plug-in object, when the driver is installed.
     driver: Option<u32>,
     vdev_rate: u32,
+    couple: bool,
     /// MACMIXER_SCREENSHOT=<file.bmp>: save a picture of the window, then quit (UI tests).
     shot: Option<String>,
     shot_state: Arc<std::sync::atomic::AtomicU8>,
@@ -228,6 +249,7 @@ impl App {
             peak_secs: cfg.peak_secs.clamp(0.5, 60.0),
             driver: find_driver(),
             vdev_rate: if VDEV_RATES.contains(&cfg.vdev_rate) { cfg.vdev_rate } else { 48_000 },
+            couple: cfg.couple,
             shot: std::env::var("MACMIXER_SCREENSHOT").ok(),
             shot_state: Arc::default(),
             started: Instant::now(),
@@ -236,6 +258,9 @@ impl App {
             saved: String::new(),
             next_id: 1,
         };
+        if app.driver.is_some() {
+            aggregate::destroy_stale();
+        }
         for b in cfg.buses {
             app.add_bus(b);
         }
@@ -255,6 +280,7 @@ impl App {
             peak_auto: self.peak_auto,
             peak_secs: self.peak_secs,
             vdev_rate: self.vdev_rate,
+            couple: self.couple,
             buses: self.buses.iter().map(|b| b.cfg.clone()).collect(),
             strips: self.strips.iter().map(|s| s.cfg.clone()).collect(),
         };
@@ -338,9 +364,7 @@ impl App {
         let mut lines = vec![String::new(); vdev::MAX_DEVICES];
         for b in &self.buses {
             if let Some(slot) = b.cfg.vslot.filter(|&s| s < vdev::MAX_DEVICES) {
-                let name = b.cfg.name.replace(['\n', '\r'], " ");
-                let name = if name.trim().is_empty() { "Output" } else { name.trim() };
-                lines[slot] = format!("{VIRTUAL_PREFIX}{name}");
+                lines[slot] = virtual_name(&b.cfg);
             }
         }
         let text = lines.join("\n");
@@ -349,9 +373,40 @@ impl App {
         }
     }
 
+    /// Keeps one aggregate "system output + virtual device" per virtual device, rebuilt
+    /// when the system output or the name changes.
+    fn sync_aggregates(&mut self) {
+        let default = if self.couple && self.driver.is_some() { aggregate::default_output() } else { None };
+        for b in &mut self.buses {
+            let desired = match (&default, b.cfg.vslot) {
+                // Only once the virtual device really exists.
+                (Some(d), Some(slot)) if vdev::get_rate(slot).is_some() => {
+                    Some((slot, (d.uid.clone(), virtual_name(&b.cfg)), d.name.clone()))
+                }
+                _ => None,
+            };
+            if b.agg.as_ref().map(|a| &a.key) == desired.as_ref().map(|d| &d.1) {
+                continue;
+            }
+            if let Some(a) = b.agg.take() {
+                aggregate::destroy(a.id);
+            }
+            if let Some((slot, key, hw_name)) = desired {
+                let name = format!("{} + {}", key.1, hw_name);
+                match aggregate::create(slot, &name, &key.0) {
+                    Ok(id) => b.agg = Some(Aggregate { id, key, name, hw_name }),
+                    Err(e) => b.verr = e,
+                }
+            }
+        }
+    }
+
     fn toggle_virtual(&mut self, j: usize) {
         if self.buses[j].cfg.vslot.is_some() {
             let b = &mut self.buses[j];
+            if let Some(a) = b.agg.take() {
+                aggregate::destroy(a.id);
+            }
             b.cfg.vslot = None;
             b.vrt = None;
             b.vstream = None;
@@ -385,6 +440,7 @@ impl App {
             vrt,
             vstream: None,
             verr: String::new(),
+            agg: None,
             rate: 0,
             vrate: 0,
             vrate_set: false,
@@ -397,7 +453,9 @@ impl App {
     }
 
     fn remove_bus(&mut self, j: usize) {
-        self.buses.remove(j);
+        if let Some(a) = self.buses.remove(j).agg {
+            aggregate::destroy(a.id);
+        }
         for (k, b) in self.buses.iter().enumerate() {
             b.rt.index.store(k, Relaxed);
             if let Some(v) = &b.vrt {
@@ -534,6 +592,7 @@ impl App {
             }
             self.driver = find_driver();
             self.sync_virtual_devices();
+            self.sync_aggregates();
             for j in 0..self.buses.len() {
                 // Reopen an output whose device or sample rate changed behind our back
                 // (system default switched, rate changed in Audio MIDI Setup or by another app).
@@ -827,6 +886,11 @@ impl eframe::App for App {
                             action = Some(Action::VirtualRate(r));
                         }
                     }
+                    ui.checkbox(&mut self.couple, "Couple with the system output").on_hover_text(
+                        "Also publishes every virtual device combined with the system output\n\
+                         device (an aggregate device), for applications such as DAWs that can\n\
+                         only open one audio device: mixer signal in, speakers out.",
+                    );
                     ui.separator();
                     ui.strong("Peak values");
                     ui.checkbox(&mut self.peak_auto, "Auto-reset");
@@ -897,7 +961,16 @@ impl eframe::App for App {
                                         if r.changed() {
                                             action = Some(Action::ToggleVirtual(j));
                                         }
-                                        warn(ui, if b.err.is_empty() { &b.verr } else { &b.err });
+                                        if !b.err.is_empty() || !b.verr.is_empty() {
+                                            warn(ui, if b.err.is_empty() { &b.verr } else { &b.err });
+                                        } else if let Some(a) = &b.agg {
+                                            ui.label(egui::RichText::new(short(&format!("+ {}", a.hw_name), 20)).small().weak())
+                                                .on_hover_text(format!(
+                                                    "Also published coupled with the system output, as the device\n“{}”.\n\
+                                                     Use that one in applications that handle a single audio device.",
+                                                    a.name
+                                                ));
+                                        }
                                     });
                                     fader_ui(ui, &mut b.cfg.db, &mut b.meter, fader_h);
                                     ui.add_space(22.0);
@@ -1055,6 +1128,9 @@ impl Drop for App {
         // The virtual devices only make sense while the mixer is running.
         for b in &mut self.buses {
             b.vstream = None;
+            if let Some(a) = b.agg.take() {
+                aggregate::destroy(a.id);
+            }
         }
         if let Some(plugin) = self.driver {
             vdev::set_names(plugin, "");

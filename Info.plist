@@ -6,6 +6,7 @@
   <key>CFBundleDisplayName</key><string>MacMixer</string>
   <key>CFBundleIdentifier</key><string>org.macmixer.MacMixer</string>
   <key>CFBundleExecutable</key><string>macmixer</string>
+  <key>CFBundleIconFile</key><string>MacMixer</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>0.1.0</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>

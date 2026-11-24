@@ -39,6 +39,15 @@ audio driver required.
 
 ## Install
 
+**With the installer**: download `MacMixer-<version>.pkg` from the
+[releases](https://github.com/phijazz/macmixer/releases) and open it. It installs the
+application and the virtual audio driver (Apple silicon only). The package is not signed
+with an Apple developer certificate, so macOS refuses a plain double-click the first
+time: right-click the file and choose Open, or allow it in System Settings → Privacy &
+Security.
+
+**From source**:
+
 ```sh
 ./install.sh
 ```
@@ -53,6 +62,8 @@ optional: without it everything works except the "Virtual device" option. On fir
 To build the bundle without installing: `./bundle.sh` (result in `target/MacMixer.app`).
 Run the app from the bundle rather than with `cargo run`: the permission prompts are
 attached to the bundle.
+
+`./package.sh` builds the graphical installer (`target/MacMixer-<version>.pkg`).
 
 To uninstall the application and the driver: `./uninstall.sh`.
 

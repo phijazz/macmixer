@@ -1179,7 +1179,10 @@ fn main() -> eframe::Result {
         return Ok(());
     }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("MacMixer").with_inner_size([900.0, 500.0]).with_min_inner_size([420.0, 340.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_title("MacMixer")
+            // Empty icon data: keep the application bundle's own icon.
+            .with_icon(egui::IconData::default()).with_inner_size([900.0, 500.0]).with_min_inner_size([420.0, 340.0]),
         ..Default::default()
     };
     eframe::run_native("MacMixer", options, Box::new(|_cc| Ok(Box::new(App::new()))))

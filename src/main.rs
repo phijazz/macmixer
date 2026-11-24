@@ -978,7 +978,7 @@ impl eframe::App for App {
                                     ui.add_space(22.0);
                                     ui.horizontal(|ui| {
                                         ui.toggle_value(&mut b.cfg.mute, "M").on_hover_text("Mute");
-                                        if n_buses > 1 && ui.button("Remove").on_hover_text("Remove this output channel").clicked() {
+                                        if n_buses > 1 && ui.button(egui::RichText::new("×").size(16.0).strong()).on_hover_text("Remove this output channel").clicked() {
                                             action = Some(Action::RemoveBus(j));
                                         }
                                     });
@@ -1043,7 +1043,7 @@ impl eframe::App for App {
                                     ui.horizontal(|ui| {
                                         ui.toggle_value(&mut s.cfg.mute, "M").on_hover_text("Mute");
                                         ui.toggle_value(&mut s.cfg.solo, "S").on_hover_text("Solo");
-                                        if ui.button("Remove").on_hover_text("Remove this input channel").clicked() {
+                                        if ui.button(egui::RichText::new("×").size(16.0).strong()).on_hover_text("Remove this input channel").clicked() {
                                             action = Some(Action::RemoveStrip(i));
                                         }
                                     });

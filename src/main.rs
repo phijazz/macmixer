@@ -753,15 +753,13 @@ fn meter_ui(ui: &mut egui::Ui, m: &Meter, height: f32) -> egui::Response {
 /// Fader drawn on exactly the same vertical scale as the meter next to it.
 fn fader_ui(ui: &mut egui::Ui, db: &mut f32, m: &mut Meter, h: f32) {
     ui.horizontal(|ui| {
-        // Double-clicking the meter also puts the fader back to 0 dB.
+        // Double-clicking the meter (not the fader) puts the fader back to 0 dB.
         if meter_ui(ui, m, h).double_clicked() {
             *db = 0.0;
         }
         let (rect, r) = ui.allocate_exact_size(egui::vec2(26.0, h), egui::Sense::click_and_drag());
-        let r = r.on_hover_text("Drag to set the level. Double-click: 0 dB");
-        if r.double_clicked() {
-            *db = 0.0;
-        } else if r.dragged() || r.is_pointer_button_down_on() {
+        let r = r.on_hover_text("Drag to set the level. Double-click the meter for 0 dB.");
+        if r.dragged() || r.is_pointer_button_down_on() {
             if let Some(pos) = r.interact_pointer_pos() {
                 let v = pos_to_db((rect.bottom() - pos.y) / rect.height());
                 *db = (v * 10.0).round() / 10.0;

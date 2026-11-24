@@ -22,7 +22,8 @@ audio driver required.
 ## Requirements
 
 - macOS 14.2 or later (process taps).
-- A Rust toolchain (`cargo`) and the Xcode command line tools.
+- A Rust toolchain (`cargo`) and the Xcode command line tools. `install.sh` offers to
+  install them if they are missing.
 
 ## Install
 
@@ -46,3 +47,7 @@ To uninstall, delete `/Applications/MacMixer.app` and
 - Sending an output channel to the *input* of another application (needs a virtual
   audio device shipped with MacMixer).
 - MIDI control, pre-fader metering.
+
+## License
+
+BSD 2-Clause, see [LICENSE](LICENSE).

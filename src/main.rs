@@ -20,7 +20,9 @@ const BUFFER_CHOICES: [u32; 7] = [32, 64, 128, 256, 512, 1024, 2048];
 const MAX_BUSES: usize = 32;
 const VDEV_RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
 /// Window height minus fader height: top bar, plus what a channel shows around its fader.
-const STRIP_OVERHEAD: f32 = 246.0;
+const STRIP_OVERHEAD: f32 = 242.0;
+/// Inner width of a channel.
+const STRIP_W: f32 = 78.0;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Default)]
 enum SourceCfg {
@@ -905,17 +907,21 @@ impl eframe::App for App {
         });
 
         // The outputs panel is as wide as its channels, up to 60% of the window.
-        let outputs_width = (self.buses.len() as f32 * 133.0 + 8.0).min(ui.available_width() * 0.6);
+        let outputs_width = (self.buses.len() as f32 * (STRIP_W + 14.0) + 20.0).min(ui.available_width() * 0.6);
         egui::Panel::right("buses").resizable(false).exact_size(outputs_width).show(ui, |ui| {
             let n_buses = self.buses.len();
             let driver_ok = self.driver.is_some();
             ui.add_space(6.0); // same top margin as the input channels
             egui::ScrollArea::horizontal().id_salt("bus_scroll").show(ui, |ui| {
                 ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     for (j, b) in self.buses.iter_mut().enumerate() {
                         ui.push_id(("bus", j), |ui| {
-                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.set_width(110.0);
+                            egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+                                ui.set_width(STRIP_W);
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                // Long names are cut with an ellipsis instead of wrapping.
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                                 ui.vertical(|ui| {
                                     ui.horizontal(|ui| {
                                         ui.strong(format!("{}", j + 1));
@@ -924,11 +930,11 @@ impl eframe::App for App {
                                     let shown = if b.cfg.hw_off {
                                         "None".to_string()
                                     } else if b.cfg.device.is_none() {
-                                        "System output".to_string()
+                                        "System".to_string()
                                     } else {
-                                        short(&b.dev_name, 15)
+                                        b.dev_name.clone()
                                     };
-                                    egui::ComboBox::from_id_salt("dev").width(104.0).selected_text(shown).show_ui(ui, |ui| {
+                                    egui::ComboBox::from_id_salt("dev").width(STRIP_W).selected_text(shown).show_ui(ui, |ui| {
                                         if ui
                                             .selectable_label(b.cfg.hw_off, "None")
                                             .on_hover_text("No hardware output (virtual device only)")
@@ -953,7 +959,7 @@ impl eframe::App for App {
                                     options_area(ui, |ui| {
                                         let mut virt = b.cfg.vslot.is_some();
                                         let r = ui
-                                            .add_enabled(driver_ok || virt, egui::Checkbox::new(&mut virt, "Virtual device"))
+                                            .add_enabled(driver_ok || virt, egui::Checkbox::new(&mut virt, "Virtual"))
                                             .on_hover_text(format!(
                                                 "Publishes this output as an audio device named “{VIRTUAL_PREFIX}{}”,\n\
                                                  which other applications can select as their input.",
@@ -966,7 +972,7 @@ impl eframe::App for App {
                                         if !b.err.is_empty() || !b.verr.is_empty() {
                                             warn(ui, if b.err.is_empty() { &b.verr } else { &b.err });
                                         } else if let Some(a) = &b.agg {
-                                            ui.label(egui::RichText::new(short(&format!("+ {}", a.hw_name), 20)).small().weak())
+                                            ui.label(egui::RichText::new(short(&format!("+ {}", a.hw_name), 14)).small().weak())
                                                 .on_hover_text(format!(
                                                     "Also published coupled with the system output, as the device\n“{}”.\n\
                                                      Use that one in applications that handle a single audio device.",
@@ -997,14 +1003,18 @@ impl eframe::App for App {
             let bus_names: Vec<String> = self.buses.iter().map(|b| b.cfg.name.clone()).collect();
             egui::ScrollArea::horizontal().id_salt("strip_scroll").show(ui, |ui| {
                 ui.horizontal_top(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     for (i, s) in self.strips.iter_mut().enumerate() {
                         ui.push_id(s.id, |ui| {
-                            egui::Frame::group(ui.style()).show(ui, |ui| {
-                                ui.set_width(110.0);
+                            egui::Frame::group(ui.style()).inner_margin(egui::Margin::same(4)).show(ui, |ui| {
+                                ui.set_width(STRIP_W);
+                                ui.spacing_mut().item_spacing.x = 4.0;
+                                // Long names are cut with an ellipsis instead of wrapping.
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
                                 ui.vertical(|ui| {
                                     ui.add(egui::TextEdit::singleline(&mut s.cfg.name).desired_width(f32::INFINITY));
                                     let picked = ui
-                                        .menu_button(short(&s.cfg.source.label(), 15), |ui| source_menu(ui, &self.in_devs, &self.apps))
+                                        .menu_button(s.cfg.source.label(), |ui| source_menu(ui, &self.in_devs, &self.apps))
                                         .inner
                                         .flatten();
                                     if let Some(src) = picked {
@@ -1032,7 +1042,7 @@ impl eframe::App for App {
                                     });
                                     fader_ui(ui, &mut s.cfg.db, &mut s.meter, fader_h);
                                     ui.scope(|ui| {
-                                        ui.spacing_mut().slider_width = 100.0;
+                                        ui.spacing_mut().slider_width = STRIP_W;
                                         let r = ui
                                             .add(egui::Slider::new(&mut s.cfg.pan, -1.0..=1.0).show_value(false))
                                             .on_hover_text("Balance (double-click: centre)");
@@ -1048,7 +1058,6 @@ impl eframe::App for App {
                                         }
                                     });
                                     ui.horizontal_wrapped(|ui| {
-                                        ui.label("→");
                                         for (j, on) in s.cfg.sends.iter_mut().enumerate() {
                                             let name = bus_names.get(j).map(String::as_str).unwrap_or("");
                                             ui.toggle_value(on, format!("{}", j + 1))

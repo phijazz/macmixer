@@ -1,0 +1,794 @@
+//! MacMixer — un mixeur façon jack_mixer pour macOS, sur CoreAudio.
+
+mod engine;
+mod tap;
+
+use std::path::PathBuf;
+use std::sync::atomic::Ordering::Relaxed;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use eframe::egui;
+use engine::{Bus, BusInput, StripParams, ANY_SOLO, BUFFER_FRAMES};
+use serde::{Deserialize, Serialize};
+
+const MIN_DB: f32 = -70.0;
+const MAX_DB: f32 = 6.0;
+const BUFFER_CHOICES: [u32; 7] = [32, 64, 128, 256, 512, 1024, 2048];
+const MAX_BUSES: usize = 32;
+
+#[derive(Serialize, Deserialize, Clone, PartialEq, Default)]
+enum SourceCfg {
+    #[default]
+    None,
+    Device {
+        name: String,
+        left: u16,
+        right: Option<u16>,
+    },
+    App {
+        bundle_id: String,
+        name: String,
+    },
+}
+
+impl SourceCfg {
+    fn label(&self) -> String {
+        match self {
+            SourceCfg::None => "Source…".into(),
+            SourceCfg::Device { name, left, right: Some(r) } => format!("{name} {}-{}", left + 1, r + 1),
+            SourceCfg::Device { name, left, right: None } => format!("{name} {}", left + 1),
+            SourceCfg::App { name, .. } => name.clone(),
+        }
+    }
+}
+
+fn yes() -> bool {
+    true
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct StripCfg {
+    name: String,
+    source: SourceCfg,
+    db: f32,
+    pan: f32,
+    mute: bool,
+    solo: bool,
+    /// Envoi vers chaque bus, dans l'ordre des bus.
+    #[serde(default)]
+    sends: Vec<bool>,
+    /// Source application : couper sa sortie directe (elle ne s'entend que via le mixeur).
+    #[serde(default = "yes")]
+    mute_direct: bool,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct BusCfg {
+    name: String,
+    /// `None` : sortie par défaut du système.
+    device: Option<String>,
+    db: f32,
+    mute: bool,
+}
+
+fn five() -> f32 {
+    5.0
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct Config {
+    #[serde(default)]
+    buffer: u32,
+    /// Automatically forget the numeric peak values after `peak_secs` seconds.
+    #[serde(default = "yes")]
+    peak_auto: bool,
+    #[serde(default = "five")]
+    peak_secs: f32,
+    #[serde(default)]
+    buses: Vec<BusCfg>,
+    #[serde(default)]
+    strips: Vec<StripCfg>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self { buffer: 0, peak_auto: true, peak_secs: 5.0, buses: vec![], strips: vec![] }
+    }
+}
+
+fn config_path() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    PathBuf::from(home).join("Library/Application Support/MacMixer/config.json")
+}
+
+fn db_to_gain(db: f32) -> f32 {
+    if db <= MIN_DB + 0.05 { 0.0 } else { 10f32.powf(db / 20.0) }
+}
+
+fn short(s: &str, max: usize) -> String {
+    if s.chars().count() > max {
+        s.chars().take(max - 1).collect::<String>() + "…"
+    } else {
+        s.to_string()
+    }
+}
+
+enum Handle {
+    Device(#[allow(dead_code)] cpal::Stream),
+    Tap(tap::TapSource),
+}
+
+struct Strip {
+    id: u64,
+    cfg: StripCfg,
+    params: Arc<StripParams>,
+    handle: Option<Handle>,
+    status: String,
+    meter: Meter,
+}
+
+struct BusUi {
+    cfg: BusCfg,
+    rt: Arc<Bus>,
+    stream: Option<cpal::Stream>,
+    dev_name: String,
+    err: String,
+    meter: Meter,
+}
+
+enum Action {
+    AddStrip,
+    AddBus,
+    RemoveStrip(usize),
+    Reconnect(usize),
+    RemoveBus(usize),
+    ReopenBus(usize),
+    Latency(u32),
+}
+
+struct App {
+    strips: Vec<Strip>,
+    buses: Vec<BusUi>,
+    in_devs: Vec<(String, u16)>,
+    out_devs: Vec<String>,
+    apps: Vec<tap::AppInfo>,
+    peak_auto: bool,
+    peak_secs: f32,
+    last_scan: Instant,
+    last_save: Instant,
+    saved: String,
+    next_id: u64,
+}
+
+impl App {
+    fn new() -> Self {
+        let mut cfg: Config = std::fs::read_to_string(config_path())
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        if BUFFER_CHOICES.contains(&cfg.buffer) {
+            BUFFER_FRAMES.store(cfg.buffer, Relaxed);
+        }
+        if cfg.buses.is_empty() {
+            cfg.buses.push(BusCfg { name: "Main".into(), device: None, db: 0.0, mute: false });
+        }
+        cfg.buses.truncate(MAX_BUSES);
+        let mut app = Self {
+            strips: vec![],
+            buses: vec![],
+            in_devs: engine::input_devices(),
+            out_devs: engine::output_devices(),
+            apps: tap::list_apps(),
+            peak_auto: cfg.peak_auto,
+            peak_secs: cfg.peak_secs.clamp(0.5, 60.0),
+            last_scan: Instant::now(),
+            last_save: Instant::now(),
+            saved: String::new(),
+            next_id: 1,
+        };
+        for b in cfg.buses {
+            app.add_bus(b);
+        }
+        for mut s in cfg.strips {
+            if s.sends.is_empty() {
+                s.sends.push(true);
+            }
+            app.add_strip(s);
+        }
+        app.saved = app.serialize();
+        app
+    }
+
+    fn serialize(&self) -> String {
+        let cfg = Config {
+            buffer: BUFFER_FRAMES.load(Relaxed),
+            peak_auto: self.peak_auto,
+            peak_secs: self.peak_secs,
+            buses: self.buses.iter().map(|b| b.cfg.clone()).collect(),
+            strips: self.strips.iter().map(|s| s.cfg.clone()).collect(),
+        };
+        serde_json::to_string_pretty(&cfg).unwrap_or_default()
+    }
+
+    fn save_if_changed(&mut self) {
+        let s = self.serialize();
+        if s != self.saved {
+            let path = config_path();
+            if let Some(dir) = path.parent() {
+                let _ = std::fs::create_dir_all(dir);
+            }
+            if std::fs::write(&path, &s).is_ok() {
+                self.saved = s;
+            }
+        }
+    }
+
+    fn open_bus_output(&mut self, j: usize) {
+        let b = &mut self.buses[j];
+        b.stream = None;
+        match engine::open_output(b.cfg.device.as_deref(), b.rt.clone()) {
+            Ok((stream, name)) => {
+                b.stream = Some(stream);
+                b.dev_name = name;
+                b.err.clear();
+            }
+            Err(e) => {
+                b.dev_name = b.cfg.device.clone().unwrap_or_default();
+                b.err = e;
+            }
+        }
+    }
+
+    fn add_bus(&mut self, cfg: BusCfg) {
+        if self.buses.len() >= MAX_BUSES {
+            return;
+        }
+        let rt = Bus::new(self.buses.len());
+        self.buses.push(BusUi { cfg, rt, stream: None, dev_name: String::new(), err: String::new(), meter: Meter::default() });
+        self.open_bus_output(self.buses.len() - 1);
+        self.reconnect_all();
+    }
+
+    fn remove_bus(&mut self, j: usize) {
+        self.buses.remove(j);
+        for (k, b) in self.buses.iter().enumerate() {
+            b.rt.index.store(k, Relaxed);
+        }
+        for s in &mut self.strips {
+            if j < s.cfg.sends.len() {
+                s.cfg.sends.remove(j);
+            }
+        }
+        self.reconnect_all();
+    }
+
+    fn add_strip(&mut self, cfg: StripCfg) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.strips.push(Strip { id, cfg, params: StripParams::new(), handle: None, status: String::new(), meter: Meter::default() });
+        self.connect(self.strips.len() - 1);
+    }
+
+    fn remove_strip(&mut self, i: usize) {
+        let s = self.strips.remove(i);
+        for b in &self.buses {
+            b.rt.inputs.lock().unwrap().retain(|x| x.strip_id != s.id);
+        }
+    }
+
+    fn reconnect_all(&mut self) {
+        for i in 0..self.strips.len() {
+            self.connect(i);
+        }
+    }
+
+    /// (Ré)ouvre la source d'une tranche et la branche sur tous les bus.
+    fn connect(&mut self, i: usize) {
+        let n = self.buses.len();
+        let s = &mut self.strips[i];
+        s.cfg.sends.resize(n, false);
+        for b in &self.buses {
+            b.rt.inputs.lock().unwrap().retain(|x| x.strip_id != s.id);
+        }
+        s.handle = None;
+        s.status.clear();
+        let res = match &s.cfg.source {
+            SourceCfg::None => return,
+            SourceCfg::Device { name, left, right } => {
+                engine::open_device_input(name, *left, *right, n).map(|(st, inp)| (Handle::Device(st), inp))
+            }
+            SourceCfg::App { bundle_id, .. } => match self.apps.iter().find(|a| &a.bundle_id == bundle_id) {
+                Some(a) => tap::open_tap(&a.objects, s.cfg.mute_direct, n).map(|(t, inp)| (Handle::Tap(t), inp)),
+                None => Err("app not running".into()),
+            },
+        };
+        match res {
+            Ok((h, inputs)) => {
+                for (b, input) in self.buses.iter().zip(inputs) {
+                    b.rt.inputs.lock().unwrap().push(BusInput { strip_id: s.id, params: s.params.clone(), input });
+                }
+                s.handle = Some(h);
+            }
+            Err(e) => s.status = e,
+        }
+    }
+
+    fn set_latency(&mut self, frames: u32) {
+        BUFFER_FRAMES.store(frames, Relaxed);
+        for j in 0..self.buses.len() {
+            self.open_bus_output(j);
+        }
+        self.reconnect_all();
+    }
+
+    /// Travail périodique : paramètres → threads audio, vu-mètres, rescans, sauvegarde.
+    fn tick(&mut self) {
+        let mut any_solo = false;
+        let auto = self.peak_auto.then(|| Duration::from_secs_f32(self.peak_secs));
+        for s in &mut self.strips {
+            let mask = s.cfg.sends.iter().enumerate().fold(0u32, |m, (j, on)| m | ((*on as u32) << j));
+            s.params.sends.store(mask, Relaxed);
+            s.params.gain.set(db_to_gain(s.cfg.db));
+            s.params.pan.set(s.cfg.pan);
+            s.params.mute.store(s.cfg.mute, Relaxed);
+            s.params.solo.store(s.cfg.solo, Relaxed);
+            any_solo |= s.cfg.solo;
+            s.meter.update([s.params.peak_l.take(), s.params.peak_r.take()], auto);
+        }
+        ANY_SOLO.store(any_solo, Relaxed);
+        for b in &mut self.buses {
+            let p = &b.rt.params;
+            p.gain.set(db_to_gain(b.cfg.db));
+            p.mute.store(b.cfg.mute, Relaxed);
+            b.meter.update([p.peak_l.take(), p.peak_r.take()], auto);
+        }
+
+        if self.last_scan.elapsed() > Duration::from_secs(2) {
+            self.last_scan = Instant::now();
+            self.in_devs = engine::input_devices();
+            self.out_devs = engine::output_devices();
+            self.apps = tap::list_apps();
+            for i in 0..self.strips.len() {
+                let s = &self.strips[i];
+                let stale = match (&s.cfg.source, &s.handle) {
+                    (SourceCfg::None, _) => false,
+                    (_, None) => true,
+                    // L'appli a quitté ou lancé de nouveaux processus audio : on refait le tap.
+                    (SourceCfg::App { bundle_id, .. }, Some(Handle::Tap(t))) => self
+                        .apps
+                        .iter()
+                        .find(|a| &a.bundle_id == bundle_id)
+                        .is_none_or(|a| a.objects != t.objects),
+                    _ => false,
+                };
+                if stale {
+                    self.connect(i);
+                }
+            }
+            for j in 0..self.buses.len() {
+                if self.buses[j].stream.is_none() {
+                    self.open_bus_output(j);
+                }
+            }
+        }
+        if self.last_save.elapsed() > Duration::from_secs(1) {
+            self.last_save = Instant::now();
+            self.save_if_changed();
+        }
+    }
+}
+
+/// Meter/fader scale: (dB, position 0..1), linear between marks. The marks are the graduation.
+const SCALE: [(f32, f32); 13] = [
+    (-70.0, 0.0),
+    (-60.0, 0.08),
+    (-50.0, 0.16),
+    (-40.0, 0.25),
+    (-30.0, 0.35),
+    (-20.0, 0.46),
+    (-15.0, 0.54),
+    (-10.0, 0.63),
+    (-6.0, 0.72),
+    (-3.0, 0.79),
+    (0.0, 0.86),
+    (3.0, 0.93),
+    (6.0, 1.0),
+];
+
+fn db_to_pos(db: f32) -> f32 {
+    let db = db.clamp(MIN_DB, MAX_DB);
+    for w in SCALE.windows(2) {
+        let ((d0, p0), (d1, p1)) = (w[0], w[1]);
+        if db <= d1 {
+            return p0 + (db - d0) / (d1 - d0) * (p1 - p0);
+        }
+    }
+    1.0
+}
+
+fn pos_to_db(p: f32) -> f32 {
+    let p = p.clamp(0.0, 1.0);
+    for w in SCALE.windows(2) {
+        let ((d0, p0), (d1, p1)) = (w[0], w[1]);
+        if p <= p1 {
+            return d0 + (p - p0) / (p1 - p0) * (d1 - d0);
+        }
+    }
+    MAX_DB
+}
+
+fn to_db(lin: f32) -> f32 {
+    20.0 * lin.max(1e-7).log10()
+}
+
+/// Meter state: falling level, short peak-hold marker, and the numeric peak value.
+#[derive(Default)]
+struct Meter {
+    level: [f32; 2],
+    hold: [f32; 2],
+    hold_at: [Option<Instant>; 2],
+    max: f32,
+    max_at: Option<Instant>,
+}
+
+impl Meter {
+    /// `auto_reset`: forget the numeric peak once it is older than this.
+    fn update(&mut self, pk: [f32; 2], auto_reset: Option<Duration>) {
+        for i in 0..2 {
+            self.level[i] = pk[i].max(self.level[i] * 0.88);
+            let expired = self.hold_at[i].is_none_or(|t| t.elapsed() > Duration::from_millis(1500));
+            if pk[i] >= self.hold[i] || expired {
+                self.hold[i] = self.level[i];
+                self.hold_at[i] = Some(Instant::now());
+            }
+        }
+        let m = pk[0].max(pk[1]);
+        let expired = match (auto_reset, self.max_at) {
+            (Some(d), Some(t)) => t.elapsed() > d,
+            _ => false,
+        };
+        if (m >= self.max && m > 0.0) || expired {
+            self.max = m;
+            self.max_at = Some(Instant::now());
+        }
+    }
+
+    fn reset(&mut self) {
+        self.max = 0.0;
+        self.max_at = None;
+    }
+}
+
+fn level_color(db: f32) -> egui::Color32 {
+    if db > 0.0 {
+        egui::Color32::from_rgb(230, 60, 50)
+    } else if db > -10.0 {
+        egui::Color32::from_rgb(215, 185, 55)
+    } else {
+        egui::Color32::from_rgb(60, 170, 80)
+    }
+}
+
+/// Stereo meter with the numbered graduation drawn on top of the bars.
+fn meter_ui(ui: &mut egui::Ui, m: &Meter, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, height), egui::Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, egui::CornerRadius::same(2), egui::Color32::from_gray(20));
+    let y_of = |db: f32| rect.bottom() - db_to_pos(db) * rect.height();
+    for i in 0..2 {
+        let x0 = rect.left() + 1.0 + i as f32 * 20.0;
+        let db = to_db(m.level[i]);
+        p.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x0, y_of(db)), egui::pos2(x0 + 18.0, rect.bottom())),
+            egui::CornerRadius::ZERO,
+            level_color(db),
+        );
+        // Peak-hold marker.
+        let hold_db = to_db(m.hold[i]);
+        if hold_db > MIN_DB {
+            let y = y_of(hold_db).max(rect.top() + 1.0);
+            p.hline(egui::Rangef::new(x0, x0 + 18.0), y, egui::Stroke::new(2.0, level_color(hold_db)));
+        }
+    }
+    // Graduation: a faint line and a number at every scale mark.
+    let font = egui::FontId::proportional(9.0);
+    for (db, _) in SCALE {
+        let y = y_of(db);
+        let strong = db == 0.0;
+        let line = egui::Color32::from_white_alpha(if strong { 150 } else { 55 });
+        p.hline(rect.x_range(), y, egui::Stroke::new(1.0, line));
+        let text = if db > 0.0 { format!("+{db:.0}") } else { format!("{db:.0}") };
+        let pos = egui::pos2(rect.center().x, y.clamp(rect.top() + 6.0, rect.bottom() - 6.0));
+        p.text(pos + egui::vec2(1.0, 1.0), egui::Align2::CENTER_CENTER, &text, font.clone(), egui::Color32::BLACK);
+        p.text(pos, egui::Align2::CENTER_CENTER, &text, font.clone(), egui::Color32::from_gray(235));
+    }
+}
+
+/// Fader drawn on exactly the same vertical scale as the meter next to it.
+fn fader_ui(ui: &mut egui::Ui, db: &mut f32, m: &mut Meter) {
+    let h = 250.0;
+    ui.horizontal(|ui| {
+        meter_ui(ui, m, h);
+        let (rect, r) = ui.allocate_exact_size(egui::vec2(26.0, h), egui::Sense::click_and_drag());
+        let r = r.on_hover_text("Drag to set the level. Double-click: 0 dB");
+        if r.double_clicked() {
+            *db = 0.0;
+        } else if r.dragged() || r.is_pointer_button_down_on() {
+            if let Some(pos) = r.interact_pointer_pos() {
+                let v = pos_to_db((rect.bottom() - pos.y) / rect.height());
+                *db = (v * 10.0).round() / 10.0;
+            }
+        }
+        let p = ui.painter();
+        let cx = rect.center().x;
+        p.vline(cx, rect.y_range(), egui::Stroke::new(3.0, egui::Color32::from_gray(60)));
+        for (mark, _) in SCALE {
+            let y = rect.bottom() - db_to_pos(mark) * rect.height();
+            let half = if mark == 0.0 { 9.0 } else { 5.0 };
+            p.hline(egui::Rangef::new(cx - half, cx + half), y, egui::Stroke::new(1.0, egui::Color32::from_gray(110)));
+        }
+        let y = rect.bottom() - db_to_pos(*db) * rect.height();
+        let handle = egui::Rect::from_center_size(egui::pos2(cx, y), egui::vec2(24.0, 12.0));
+        let fill = if r.dragged() { egui::Color32::from_gray(210) } else { egui::Color32::from_gray(170) };
+        p.rect_filled(handle, egui::CornerRadius::same(3), fill);
+        p.hline(handle.x_range(), y, egui::Stroke::new(1.5, egui::Color32::BLACK));
+    });
+    ui.label(if *db <= MIN_DB + 0.05 { "-∞ dB".to_string() } else { format!("{:+.1} dB", *db) });
+    let max_db = to_db(m.max);
+    let text = if max_db <= MIN_DB { "peak  -∞".to_string() } else { format!("peak {max_db:+.1}") };
+    let color = if max_db > 0.0 { egui::Color32::from_rgb(230, 60, 50) } else { ui.visuals().text_color() };
+    if ui
+        .add(egui::Button::new(egui::RichText::new(text).small().color(color)).frame(false))
+        .on_hover_text("Highest peak (dB). Click to reset.")
+        .clicked()
+    {
+        m.reset();
+    }
+}
+
+fn source_menu(ui: &mut egui::Ui, in_devs: &[(String, u16)], apps: &[tap::AppInfo]) -> Option<SourceCfg> {
+    let mut pick = None;
+    if ui.button("None").clicked() {
+        pick = Some(SourceCfg::None);
+    }
+    ui.menu_button("Devices", |ui| {
+        if in_devs.is_empty() {
+            ui.label("(no input device)");
+        }
+        for (name, ch) in in_devs {
+            ui.menu_button(name, |ui| {
+                for c in (0..ch.saturating_sub(1)).step_by(2) {
+                    if ui.button(format!("Stereo {}-{}", c + 1, c + 2)).clicked() {
+                        pick = Some(SourceCfg::Device { name: name.clone(), left: c, right: Some(c + 1) });
+                    }
+                }
+                for c in 0..*ch {
+                    if ui.button(format!("Mono {}", c + 1)).clicked() {
+                        pick = Some(SourceCfg::Device { name: name.clone(), left: c, right: None });
+                    }
+                }
+            });
+        }
+    });
+    ui.menu_button("Applications", |ui| {
+        if apps.is_empty() {
+            ui.label("(no audio app)");
+        }
+        for a in apps {
+            let label = if a.playing { format!("▶ {}", a.name) } else { a.name.clone() };
+            if ui.button(label).on_hover_text(&a.bundle_id).clicked() {
+                pick = Some(SourceCfg::App { bundle_id: a.bundle_id.clone(), name: a.name.clone() });
+            }
+        }
+    });
+    if pick.is_some() {
+        ui.close();
+    }
+    pick
+}
+
+fn warn(ui: &mut egui::Ui, text: &str) {
+    if !text.is_empty() {
+        ui.colored_label(egui::Color32::from_rgb(230, 160, 60), egui::RichText::new(text).small());
+    }
+}
+
+impl eframe::App for App {
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        self.tick();
+        let mut action = None;
+
+        egui::Panel::top("bar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                if ui.button("+ Input").clicked() {
+                    action = Some(Action::AddStrip);
+                }
+                if ui.add_enabled(self.buses.len() < MAX_BUSES, egui::Button::new("+ Output")).clicked() {
+                    action = Some(Action::AddBus);
+                }
+                ui.separator();
+                ui.menu_button("Settings", |ui| {
+                    ui.strong("Latency").on_hover_text(
+                        "Buffer size requested from each device.\n\
+                         Smaller: less delay, but more risk of crackles.",
+                    );
+                    let cur = BUFFER_FRAMES.load(Relaxed);
+                    for f in BUFFER_CHOICES {
+                        let text = format!("{f} frames (~{:.1} ms)", f as f32 / 48.0);
+                        if ui.radio(f == cur, text).clicked() && f != cur {
+                            action = Some(Action::Latency(f));
+                        }
+                    }
+                    ui.separator();
+                    ui.strong("Peak values");
+                    ui.checkbox(&mut self.peak_auto, "Auto-reset");
+                    ui.add_enabled(
+                        self.peak_auto,
+                        egui::Slider::new(&mut self.peak_secs, 0.5..=60.0).logarithmic(true).suffix(" s").text("after"),
+                    );
+                });
+            });
+        });
+
+        egui::Panel::right("buses").show(ui, |ui| {
+            let n_buses = self.buses.len();
+            egui::ScrollArea::horizontal().id_salt("bus_scroll").show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    for (j, b) in self.buses.iter_mut().enumerate() {
+                        ui.push_id(("bus", j), |ui| {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_width(110.0);
+                                ui.vertical(|ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.strong(format!("{}", j + 1));
+                                        ui.add(egui::TextEdit::singleline(&mut b.cfg.name).desired_width(f32::INFINITY));
+                                    });
+                                    let shown = if b.cfg.device.is_none() { "System output".to_string() } else { short(&b.dev_name, 15) };
+                                    egui::ComboBox::from_id_salt("dev").width(104.0).selected_text(shown).show_ui(ui, |ui| {
+                                        if ui.selectable_label(b.cfg.device.is_none(), "Sortie système").clicked() {
+                                            b.cfg.device = None;
+                                            action = Some(Action::ReopenBus(j));
+                                        }
+                                        for d in &self.out_devs {
+                                            if ui.selectable_label(b.cfg.device.as_ref() == Some(d), d).clicked() {
+                                                b.cfg.device = Some(d.clone());
+                                                action = Some(Action::ReopenBus(j));
+                                            }
+                                        }
+                                    });
+                                    warn(ui, &b.err);
+                                    fader_ui(ui, &mut b.cfg.db, &mut b.meter);
+                                    ui.add_space(22.0);
+                                    ui.horizontal(|ui| {
+                                        ui.toggle_value(&mut b.cfg.mute, "M").on_hover_text("Mute");
+                                        if n_buses > 1 && ui.button("Remove").on_hover_text("Remove this output channel").clicked() {
+                                            action = Some(Action::RemoveBus(j));
+                                        }
+                                    });
+                                });
+                            });
+                        });
+                    }
+                });
+            });
+        });
+
+        egui::CentralPanel::default().show(ui, |ui| {
+            if self.strips.is_empty() {
+                ui.label("Add an input channel with “+ Input”, then pick its source.");
+            }
+            let bus_names: Vec<String> = self.buses.iter().map(|b| b.cfg.name.clone()).collect();
+            egui::ScrollArea::horizontal().id_salt("strip_scroll").show(ui, |ui| {
+                ui.horizontal_top(|ui| {
+                    for (i, s) in self.strips.iter_mut().enumerate() {
+                        ui.push_id(s.id, |ui| {
+                            egui::Frame::group(ui.style()).show(ui, |ui| {
+                                ui.set_width(110.0);
+                                ui.vertical(|ui| {
+                                    ui.add(egui::TextEdit::singleline(&mut s.cfg.name).desired_width(f32::INFINITY));
+                                    let picked = ui
+                                        .menu_button(short(&s.cfg.source.label(), 15), |ui| source_menu(ui, &self.in_devs, &self.apps))
+                                        .inner
+                                        .flatten();
+                                    if let Some(src) = picked {
+                                        if s.cfg.name.starts_with("Input") || s.cfg.name.is_empty() {
+                                            if let SourceCfg::App { name, .. } | SourceCfg::Device { name, .. } = &src {
+                                                s.cfg.name = name.clone();
+                                            }
+                                        }
+                                        s.cfg.source = src;
+                                        action = Some(Action::Reconnect(i));
+                                    }
+                                    if matches!(s.cfg.source, SourceCfg::App { .. })
+                                        && ui
+                                            .checkbox(&mut s.cfg.mute_direct, "Exclusive")
+                                            .on_hover_text(
+                                                "Silences the app's own output: it is only heard through the mixer.\n\
+                                                 Unchecked: the app also keeps playing on its usual output.",
+                                            )
+                                            .changed()
+                                    {
+                                        action = Some(Action::Reconnect(i));
+                                    }
+                                    warn(ui, &s.status);
+                                    fader_ui(ui, &mut s.cfg.db, &mut s.meter);
+                                    ui.scope(|ui| {
+                                        ui.spacing_mut().slider_width = 100.0;
+                                        let r = ui
+                                            .add(egui::Slider::new(&mut s.cfg.pan, -1.0..=1.0).show_value(false))
+                                            .on_hover_text("Balance (double-click: centre)");
+                                        if r.double_clicked() {
+                                            s.cfg.pan = 0.0;
+                                        }
+                                    });
+                                    ui.horizontal(|ui| {
+                                        ui.toggle_value(&mut s.cfg.mute, "M").on_hover_text("Mute");
+                                        ui.toggle_value(&mut s.cfg.solo, "S").on_hover_text("Solo");
+                                        if ui.button("Remove").on_hover_text("Remove this input channel").clicked() {
+                                            action = Some(Action::RemoveStrip(i));
+                                        }
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label("→");
+                                        for (j, on) in s.cfg.sends.iter_mut().enumerate() {
+                                            let name = bus_names.get(j).map(String::as_str).unwrap_or("");
+                                            ui.toggle_value(on, format!("{}", j + 1))
+                                                .on_hover_text(format!("Send to output {} “{name}”", j + 1));
+                                        }
+                                    });
+                                });
+                            });
+                        });
+                    }
+                });
+            });
+        });
+
+        match action {
+            Some(Action::AddStrip) => {
+                let n = self.strips.len() + 1;
+                let mut sends = vec![false; self.buses.len()];
+                sends[0] = true;
+                self.add_strip(StripCfg {
+                    name: format!("Input {n}"),
+                    source: SourceCfg::None,
+                    db: 0.0,
+                    pan: 0.0,
+                    mute: false,
+                    solo: false,
+                    sends,
+                    mute_direct: true,
+                });
+            }
+            Some(Action::AddBus) => {
+                let n = self.buses.len() + 1;
+                self.add_bus(BusCfg { name: format!("Output {n}"), device: None, db: 0.0, mute: false });
+            }
+            Some(Action::RemoveStrip(i)) => self.remove_strip(i),
+            Some(Action::Reconnect(i)) => {
+                self.apps = tap::list_apps();
+                self.connect(i);
+            }
+            Some(Action::RemoveBus(j)) => self.remove_bus(j),
+            Some(Action::ReopenBus(j)) => self.open_bus_output(j),
+            Some(Action::Latency(f)) => self.set_latency(f),
+            None => {}
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(33));
+    }
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.save_if_changed();
+    }
+}
+
+fn main() -> eframe::Result {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_title("MacMixer").with_inner_size([900.0, 500.0]),
+        ..Default::default()
+    };
+    eframe::run_native("MacMixer", options, Box::new(|_cc| Ok(Box::new(App::new()))))
+}

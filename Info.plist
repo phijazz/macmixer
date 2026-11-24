@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>MacMixer</string>
+  <key>CFBundleDisplayName</key><string>MacMixer</string>
+  <key>CFBundleIdentifier</key><string>org.macmixer.MacMixer</string>
+  <key>CFBundleExecutable</key><string>macmixer</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.2</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <key>NSMicrophoneUsageDescription</key><string>MacMixer mixes the inputs of your audio devices.</string>
+  <key>NSAudioCaptureUsageDescription</key><string>MacMixer captures the audio of the applications you choose to mix.</string>
+</dict>
+</plist>

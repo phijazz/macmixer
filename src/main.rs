@@ -2,6 +2,7 @@
 
 mod engine;
 mod tap;
+mod vdev;
 
 use std::path::PathBuf;
 use std::sync::atomic::Ordering::Relaxed;
@@ -9,7 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use engine::{Bus, BusInput, StripParams, ANY_SOLO, BUFFER_FRAMES};
+use engine::{Bus, BusInput, StripParams, Target, ANY_SOLO, BUFFER_FRAMES, VIRTUAL_PREFIX};
 use serde::{Deserialize, Serialize};
 
 const MIN_DB: f32 = -70.0;
@@ -70,6 +71,12 @@ struct BusCfg {
     device: Option<String>,
     db: f32,
     mute: bool,
+    /// No hardware output at all (virtual device only).
+    #[serde(default)]
+    hw_off: bool,
+    /// Slot of this output's virtual device in the MacMixer driver, if enabled.
+    #[serde(default)]
+    vslot: Option<usize>,
 }
 
 fn five() -> f32 {
@@ -134,6 +141,10 @@ struct BusUi {
     stream: Option<cpal::Stream>,
     dev_name: String,
     err: String,
+    /// Second sink feeding this output's virtual device.
+    vrt: Option<Arc<Bus>>,
+    vstream: Option<cpal::Stream>,
+    verr: String,
     meter: Meter,
 }
 
@@ -144,6 +155,7 @@ enum Action {
     Reconnect(usize),
     RemoveBus(usize),
     ReopenBus(usize),
+    ToggleVirtual(usize),
     Latency(u32),
 }
 
@@ -155,6 +167,8 @@ struct App {
     apps: Vec<tap::AppInfo>,
     peak_auto: bool,
     peak_secs: f32,
+    /// The virtual audio driver's plug-in object, when the driver is installed.
+    driver: Option<u32>,
     last_scan: Instant,
     last_save: Instant,
     saved: String,
@@ -171,7 +185,7 @@ impl App {
             BUFFER_FRAMES.store(cfg.buffer, Relaxed);
         }
         if cfg.buses.is_empty() {
-            cfg.buses.push(BusCfg { name: "Main".into(), device: None, db: 0.0, mute: false });
+            cfg.buses.push(BusCfg { name: "Main".into(), device: None, db: 0.0, mute: false, hw_off: false, vslot: None });
         }
         cfg.buses.truncate(MAX_BUSES);
         let mut app = Self {
@@ -182,6 +196,7 @@ impl App {
             apps: tap::list_apps(),
             peak_auto: cfg.peak_auto,
             peak_secs: cfg.peak_secs.clamp(0.5, 60.0),
+            driver: vdev::plugin(),
             last_scan: Instant::now(),
             last_save: Instant::now(),
             saved: String::new(),
@@ -227,11 +242,19 @@ impl App {
     fn open_bus_output(&mut self, j: usize) {
         let b = &mut self.buses[j];
         b.stream = None;
-        match engine::open_output(b.cfg.device.as_deref(), b.rt.clone()) {
+        b.err.clear();
+        if b.cfg.hw_off {
+            b.dev_name.clear();
+            return;
+        }
+        let target = match &b.cfg.device {
+            Some(name) => Target::Name(name),
+            None => Target::Default,
+        };
+        match engine::open_output(&target, b.rt.clone()) {
             Ok((stream, name)) => {
                 b.stream = Some(stream);
                 b.dev_name = name;
-                b.err.clear();
             }
             Err(e) => {
                 b.dev_name = b.cfg.device.clone().unwrap_or_default();
@@ -240,13 +263,80 @@ impl App {
         }
     }
 
+    /// Starts playing an output channel into its virtual device.
+    fn open_virtual(&mut self, j: usize) {
+        let b = &mut self.buses[j];
+        b.vstream = None;
+        b.verr.clear();
+        let (Some(slot), Some(vrt)) = (b.cfg.vslot, b.vrt.clone()) else { return };
+        if self.driver.is_none() {
+            b.verr = "driver not installed".into();
+            return;
+        }
+        match engine::open_output(&Target::Uid(&vdev::uid(slot)), vrt) {
+            Ok((stream, _)) => b.vstream = Some(stream),
+            // The device appears a moment after it is requested; retried periodically.
+            Err(_) => b.verr = "virtual device starting…".into(),
+        }
+    }
+
+    /// Tells the driver which virtual devices should exist (one per enabled output).
+    fn sync_virtual_devices(&mut self) {
+        let Some(plugin) = self.driver else { return };
+        let mut lines = vec![String::new(); vdev::MAX_DEVICES];
+        for b in &self.buses {
+            if let Some(slot) = b.cfg.vslot.filter(|&s| s < vdev::MAX_DEVICES) {
+                let name = b.cfg.name.replace(['\n', '\r'], " ");
+                let name = if name.trim().is_empty() { "Output" } else { name.trim() };
+                lines[slot] = format!("{VIRTUAL_PREFIX}{name}");
+            }
+        }
+        let text = lines.join("\n");
+        if vdev::get_names(plugin).as_deref() != Some(&text) {
+            vdev::set_names(plugin, &text);
+        }
+    }
+
+    fn toggle_virtual(&mut self, j: usize) {
+        if self.buses[j].cfg.vslot.is_some() {
+            let b = &mut self.buses[j];
+            b.cfg.vslot = None;
+            b.vrt = None;
+            b.vstream = None;
+            b.verr.clear();
+        } else {
+            let used: Vec<usize> = self.buses.iter().filter_map(|b| b.cfg.vslot).collect();
+            let Some(slot) = (0..vdev::MAX_DEVICES).find(|s| !used.contains(s)) else { return };
+            let b = &mut self.buses[j];
+            b.cfg.vslot = Some(slot);
+            b.vrt = Some(Bus::sharing(b.rt.params.clone(), j));
+        }
+        self.sync_virtual_devices();
+        self.open_virtual(j);
+        self.reconnect_all();
+    }
+
     fn add_bus(&mut self, cfg: BusCfg) {
         if self.buses.len() >= MAX_BUSES {
             return;
         }
-        let rt = Bus::new(self.buses.len());
-        self.buses.push(BusUi { cfg, rt, stream: None, dev_name: String::new(), err: String::new(), meter: Meter::default() });
-        self.open_bus_output(self.buses.len() - 1);
+        let j = self.buses.len();
+        let rt = Bus::new(j);
+        let vrt = cfg.vslot.map(|_| Bus::sharing(rt.params.clone(), j));
+        self.buses.push(BusUi {
+            cfg,
+            rt,
+            stream: None,
+            dev_name: String::new(),
+            err: String::new(),
+            vrt,
+            vstream: None,
+            verr: String::new(),
+            meter: Meter::default(),
+        });
+        self.sync_virtual_devices();
+        self.open_bus_output(j);
+        self.open_virtual(j);
         self.reconnect_all();
     }
 
@@ -254,13 +344,34 @@ impl App {
         self.buses.remove(j);
         for (k, b) in self.buses.iter().enumerate() {
             b.rt.index.store(k, Relaxed);
+            if let Some(v) = &b.vrt {
+                v.index.store(k, Relaxed);
+            }
         }
         for s in &mut self.strips {
             if j < s.cfg.sends.len() {
                 s.cfg.sends.remove(j);
             }
         }
+        self.sync_virtual_devices();
         self.reconnect_all();
+    }
+
+    /// Every running sink: the hardware output and/or the virtual device of each output.
+    fn sinks(&self) -> Vec<Arc<Bus>> {
+        self.buses
+            .iter()
+            .flat_map(|b| (!b.cfg.hw_off).then(|| b.rt.clone()).into_iter().chain(b.vrt.clone()))
+            .collect()
+    }
+
+    fn detach(&self, strip_id: u64) {
+        for b in &self.buses {
+            b.rt.inputs.lock().unwrap().retain(|x| x.strip_id != strip_id);
+            if let Some(v) = &b.vrt {
+                v.inputs.lock().unwrap().retain(|x| x.strip_id != strip_id);
+            }
+        }
     }
 
     fn add_strip(&mut self, cfg: StripCfg) {
@@ -272,9 +383,7 @@ impl App {
 
     fn remove_strip(&mut self, i: usize) {
         let s = self.strips.remove(i);
-        for b in &self.buses {
-            b.rt.inputs.lock().unwrap().retain(|x| x.strip_id != s.id);
-        }
+        self.detach(s.id);
     }
 
     fn reconnect_all(&mut self) {
@@ -285,12 +394,12 @@ impl App {
 
     /// (Ré)ouvre la source d'une tranche et la branche sur tous les bus.
     fn connect(&mut self, i: usize) {
-        let n = self.buses.len();
+        let sinks = self.sinks();
+        let n = sinks.len();
+        self.detach(self.strips[i].id);
+        let n_outputs = self.buses.len();
         let s = &mut self.strips[i];
-        s.cfg.sends.resize(n, false);
-        for b in &self.buses {
-            b.rt.inputs.lock().unwrap().retain(|x| x.strip_id != s.id);
-        }
+        s.cfg.sends.resize(n_outputs, false);
         s.handle = None;
         s.status.clear();
         let res = match &s.cfg.source {
@@ -305,8 +414,8 @@ impl App {
         };
         match res {
             Ok((h, inputs)) => {
-                for (b, input) in self.buses.iter().zip(inputs) {
-                    b.rt.inputs.lock().unwrap().push(BusInput { strip_id: s.id, params: s.params.clone(), input });
+                for (sink, input) in sinks.iter().zip(inputs) {
+                    sink.inputs.lock().unwrap().push(BusInput { strip_id: s.id, params: s.params.clone(), input });
                 }
                 s.handle = Some(h);
             }
@@ -318,6 +427,7 @@ impl App {
         BUFFER_FRAMES.store(frames, Relaxed);
         for j in 0..self.buses.len() {
             self.open_bus_output(j);
+            self.open_virtual(j);
         }
         self.reconnect_all();
     }
@@ -366,9 +476,14 @@ impl App {
                     self.connect(i);
                 }
             }
+            self.driver = vdev::plugin();
+            self.sync_virtual_devices();
             for j in 0..self.buses.len() {
-                if self.buses[j].stream.is_none() {
+                if self.buses[j].stream.is_none() && !self.buses[j].cfg.hw_off {
                     self.open_bus_output(j);
+                }
+                if self.buses[j].vstream.is_none() && self.buses[j].cfg.vslot.is_some() {
+                    self.open_virtual(j);
                 }
             }
         }
@@ -633,6 +748,7 @@ impl eframe::App for App {
 
         egui::Panel::right("buses").show(ui, |ui| {
             let n_buses = self.buses.len();
+            let driver_ok = self.driver.is_some();
             egui::ScrollArea::horizontal().id_salt("bus_scroll").show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     for (j, b) in self.buses.iter_mut().enumerate() {
@@ -644,20 +760,49 @@ impl eframe::App for App {
                                         ui.strong(format!("{}", j + 1));
                                         ui.add(egui::TextEdit::singleline(&mut b.cfg.name).desired_width(f32::INFINITY));
                                     });
-                                    let shown = if b.cfg.device.is_none() { "System output".to_string() } else { short(&b.dev_name, 15) };
+                                    let shown = if b.cfg.hw_off {
+                                        "None".to_string()
+                                    } else if b.cfg.device.is_none() {
+                                        "System output".to_string()
+                                    } else {
+                                        short(&b.dev_name, 15)
+                                    };
                                     egui::ComboBox::from_id_salt("dev").width(104.0).selected_text(shown).show_ui(ui, |ui| {
-                                        if ui.selectable_label(b.cfg.device.is_none(), "Sortie système").clicked() {
+                                        if ui
+                                            .selectable_label(b.cfg.hw_off, "None")
+                                            .on_hover_text("No hardware output (virtual device only)")
+                                            .clicked()
+                                        {
+                                            b.cfg.hw_off = true;
+                                            action = Some(Action::ReopenBus(j));
+                                        }
+                                        if ui.selectable_label(!b.cfg.hw_off && b.cfg.device.is_none(), "System output").clicked() {
                                             b.cfg.device = None;
+                                            b.cfg.hw_off = false;
                                             action = Some(Action::ReopenBus(j));
                                         }
                                         for d in &self.out_devs {
-                                            if ui.selectable_label(b.cfg.device.as_ref() == Some(d), d).clicked() {
+                                            if ui.selectable_label(!b.cfg.hw_off && b.cfg.device.as_ref() == Some(d), d).clicked() {
                                                 b.cfg.device = Some(d.clone());
+                                                b.cfg.hw_off = false;
                                                 action = Some(Action::ReopenBus(j));
                                             }
                                         }
                                     });
+                                    let mut virt = b.cfg.vslot.is_some();
+                                    let r = ui
+                                        .add_enabled(driver_ok || virt, egui::Checkbox::new(&mut virt, "Virtual device"))
+                                        .on_hover_text(format!(
+                                            "Publishes this output as an audio device named “{VIRTUAL_PREFIX}{}”,\n\
+                                             which other applications can select as their input.",
+                                            b.cfg.name
+                                        ))
+                                        .on_disabled_hover_text("The MacMixer audio driver is not installed. Run ./install.sh to install it.");
+                                    if r.changed() {
+                                        action = Some(Action::ToggleVirtual(j));
+                                    }
                                     warn(ui, &b.err);
+                                    warn(ui, &b.verr);
                                     fader_ui(ui, &mut b.cfg.db, &mut b.meter);
                                     ui.add_space(22.0);
                                     ui.horizontal(|ui| {
@@ -711,6 +856,10 @@ impl eframe::App for App {
                                     {
                                         action = Some(Action::Reconnect(i));
                                     }
+                                    if !matches!(s.cfg.source, SourceCfg::App { .. }) {
+                                        // Keeps the faders of all channels on the same line.
+                                        ui.allocate_exact_size(egui::vec2(1.0, ui.spacing().interact_size.y), egui::Sense::hover());
+                                    }
                                     warn(ui, &s.status);
                                     fader_ui(ui, &mut s.cfg.db, &mut s.meter);
                                     ui.scope(|ui| {
@@ -763,7 +912,7 @@ impl eframe::App for App {
             }
             Some(Action::AddBus) => {
                 let n = self.buses.len() + 1;
-                self.add_bus(BusCfg { name: format!("Output {n}"), device: None, db: 0.0, mute: false });
+                self.add_bus(BusCfg { name: format!("Output {n}"), device: None, db: 0.0, mute: false, hw_off: false, vslot: None });
             }
             Some(Action::RemoveStrip(i)) => self.remove_strip(i),
             Some(Action::Reconnect(i)) => {
@@ -771,7 +920,11 @@ impl eframe::App for App {
                 self.connect(i);
             }
             Some(Action::RemoveBus(j)) => self.remove_bus(j),
-            Some(Action::ReopenBus(j)) => self.open_bus_output(j),
+            Some(Action::ReopenBus(j)) => {
+                self.open_bus_output(j);
+                self.reconnect_all();
+            }
+            Some(Action::ToggleVirtual(j)) => self.toggle_virtual(j),
             Some(Action::Latency(f)) => self.set_latency(f),
             None => {}
         }
@@ -782,6 +935,13 @@ impl eframe::App for App {
 impl Drop for App {
     fn drop(&mut self) {
         self.save_if_changed();
+        // The virtual devices only make sense while the mixer is running.
+        for b in &mut self.buses {
+            b.vstream = None;
+        }
+        if let Some(plugin) = self.driver {
+            vdev::set_names(plugin, "");
+        }
     }
 }
 

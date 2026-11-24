@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build MacMixer and install it into /Applications (or ~/Applications if not writable).
+# Build MacMixer and install it into /Applications (or ~/Applications if not writable),
+# then offer to install its virtual audio driver.
 # Installs the build prerequisites first if they are missing.
 set -e
 cd "$(dirname "$0")"
@@ -30,10 +31,32 @@ if ! command -v cargo >/dev/null 2>&1; then
     esac
 fi
 
-# 3. Build and install.
+# 3. Build and install the application.
 ./bundle.sh
 DEST=/Applications
 [ -w "$DEST" ] || { DEST="$HOME/Applications"; mkdir -p "$DEST"; }
 rm -rf "$DEST/MacMixer.app"
 ditto target/MacMixer.app "$DEST/MacMixer.app"
 echo "Installed: $DEST/MacMixer.app"
+
+# 4. Virtual audio driver (optional): lets other applications record MacMixer outputs.
+HAL=/Library/Audio/Plug-Ins/HAL
+if cmp -s target/MacMixer.driver/Contents/MacOS/MacMixerDriver "$HAL/MacMixer.driver/Contents/MacOS/MacMixerDriver"; then
+    echo "Virtual audio driver already up to date."
+    exit 0
+fi
+echo
+echo "The virtual audio driver lets other applications use a MacMixer output as their"
+echo "audio input. Installing it needs your administrator password and restarts the"
+echo "system audio service (sound stops for a second or two in all applications)."
+printf "Install the virtual audio driver now? [Y/n] "
+read -r answer
+case "$answer" in
+    n|N|no|non)
+        echo "Driver not installed. Run ./install.sh again to install it later."
+        ;;
+    *)
+        sudo sh -c "mkdir -p '$HAL' && rm -rf '$HAL/MacMixer.driver' && ditto target/MacMixer.driver '$HAL/MacMixer.driver' && chown -R root:wheel '$HAL/MacMixer.driver' && killall coreaudiod"
+        echo "Installed: $HAL/MacMixer.driver"
+        ;;
+esac

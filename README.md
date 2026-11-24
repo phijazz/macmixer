@@ -15,6 +15,10 @@ audio driver required.
     through the mixer.
 - **Output channels**, each with its own output device, fader, meter and mute.
   Every input channel can be sent to any combination of outputs.
+- **Virtual devices**: with "Virtual device" ticked, an output channel is also published
+  as an audio device named "MacMixer: <output name>" that any other application can
+  select as its input (48 kHz stereo). This uses MacMixer's own small audio driver;
+  the devices exist only while MacMixer is running.
 - **Settings**: latency (device buffer size) and peak auto-reset time.
 - The whole setup is saved automatically to
   `~/Library/Application Support/MacMixer/config.json`.
@@ -32,21 +36,29 @@ audio driver required.
 ```
 
 This builds a release binary, wraps it in `MacMixer.app`, ad-hoc signs it and copies it
-to `/Applications`. On first use macOS asks for permission to use the microphone
+to `/Applications`. It then offers to install the virtual audio driver into
+`/Library/Audio/Plug-Ins/HAL` (administrator password required; the system audio
+service restarts, so sound stops for a moment in all applications). The driver is
+optional: without it everything works except the "Virtual device" option. On first use macOS asks for permission to use the microphone
 (device inputs) and to capture audio from other applications.
 
 To build the bundle without installing: `./bundle.sh` (result in `target/MacMixer.app`).
 Run the app from the bundle rather than with `cargo run`: the permission prompts are
 attached to the bundle.
 
-To uninstall, delete `/Applications/MacMixer.app` and
-`~/Library/Application Support/MacMixer`.
+To uninstall the application and the driver: `./uninstall.sh`.
+
+## Layout
+
+- `src/` — the application (`engine.rs` mixing and device I/O, `tap.rs` application
+  capture, `vdev.rs` driver client, `main.rs` user interface).
+- `driver/` — the virtual audio driver, a CoreAudio AudioServerPlugIn
+  (`cargo test -p macmixer-driver` runs its tests).
 
 ## Not there yet
 
-- Sending an output channel to the *input* of another application (needs a virtual
-  audio device shipped with MacMixer).
 - MIDI control, pre-fader metering.
+- Virtual devices are fixed at 48 kHz stereo.
 
 ## License
 

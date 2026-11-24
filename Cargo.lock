@@ -1858,6 +1858,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "macmixer-driver"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "objc2-core-audio",
+ "objc2-core-audio-types",
+ "objc2-core-foundation",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"

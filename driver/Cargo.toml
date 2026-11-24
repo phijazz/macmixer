@@ -1,0 +1,14 @@
+[package]
+name = "macmixer-driver"
+version = "0.1.0"
+license = "BSD-2-Clause"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+libc = "0.2.191"
+objc2-core-audio = "0.3.2"
+objc2-core-audio-types = "0.3.2"
+objc2-core-foundation = "0.3.2"

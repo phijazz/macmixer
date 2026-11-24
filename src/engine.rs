@@ -193,6 +193,11 @@ impl Bus {
         })
     }
 
+    /// A second sink for the same output channel (its virtual device): same parameters.
+    pub fn sharing(params: Arc<StripParams>, index: usize) -> Arc<Self> {
+        Arc::new(Self { params, index: AtomicUsize::new(index), inputs: Mutex::new(Vec::new()) })
+    }
+
     /// Appelé par le thread audio du périphérique de sortie.
     fn render(&self, data: &mut [f32], channels: usize, out_rate: f64) {
         data.fill(0.0);
@@ -268,7 +273,19 @@ pub fn input_devices() -> Vec<(String, u16)> {
 pub fn output_devices() -> Vec<String> {
     let host = cpal::default_host();
     let Ok(devs) = host.output_devices() else { return vec![] };
-    devs.filter_map(|d| dev_name(&d)).collect()
+    // MacMixer's own virtual devices are driven by the "Virtual device" option instead.
+    devs.filter_map(|d| dev_name(&d)).filter(|n| !n.starts_with(VIRTUAL_PREFIX)).collect()
+}
+
+/// Name prefix of the virtual devices published by the MacMixer driver.
+pub const VIRTUAL_PREFIX: &str = "MacMixer: ";
+
+/// Where an output channel plays.
+pub enum Target<'a> {
+    Default,
+    Name(&'a str),
+    /// CoreAudio device UID.
+    Uid(&'a str),
 }
 
 /// Configurations à essayer : d'abord la taille de tampon demandée, sinon celle du pilote.
@@ -323,16 +340,18 @@ pub fn open_device_input(
     Err(err)
 }
 
-/// Ouvre la sortie d'un bus (`None` → périphérique par défaut). Retourne le flux et le nom réel.
-pub fn open_output(name: Option<&str>, bus: Arc<Bus>) -> Result<(cpal::Stream, String), String> {
+/// Opens an output sink. Returns the stream and the actual device name.
+pub fn open_output(target: &Target, bus: Arc<Bus>) -> Result<(cpal::Stream, String), String> {
     let host = cpal::default_host();
-    let dev = match name {
-        Some(n) => host
-            .output_devices()
-            .map_err(|e| e.to_string())?
-            .find(|d| dev_name(d).as_deref() == Some(n))
+    let mut devs = host.output_devices().map_err(|e| e.to_string())?;
+    let dev = match target {
+        Target::Default => host.default_output_device().ok_or_else(|| "no audio output".to_string())?,
+        Target::Name(n) => {
+            devs.find(|d| dev_name(d).as_deref() == Some(*n)).ok_or_else(|| "device not found".to_string())?
+        }
+        Target::Uid(u) => devs
+            .find(|d| d.id().is_ok_and(|id| id.id() == *u))
             .ok_or_else(|| "device not found".to_string())?,
-        None => host.default_output_device().ok_or_else(|| "no audio output".to_string())?,
     };
     let cfg = dev.default_output_config().map_err(|e| e.to_string())?;
     let ch = cfg.channels() as usize;

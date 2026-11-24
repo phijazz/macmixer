@@ -715,8 +715,8 @@ fn level_color(db: f32) -> egui::Color32 {
 }
 
 /// Stereo meter with the numbered graduation drawn on top of the bars.
-fn meter_ui(ui: &mut egui::Ui, m: &Meter, height: f32) {
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(40.0, height), egui::Sense::hover());
+fn meter_ui(ui: &mut egui::Ui, m: &Meter, height: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(egui::vec2(40.0, height), egui::Sense::click());
     let p = ui.painter();
     p.rect_filled(rect, egui::CornerRadius::same(2), egui::Color32::from_gray(20));
     let y_of = |db: f32| rect.bottom() - db_to_pos(db) * rect.height();
@@ -747,12 +747,16 @@ fn meter_ui(ui: &mut egui::Ui, m: &Meter, height: f32) {
         p.text(pos + egui::vec2(1.0, 1.0), egui::Align2::CENTER_CENTER, &text, font.clone(), egui::Color32::BLACK);
         p.text(pos, egui::Align2::CENTER_CENTER, &text, font.clone(), egui::Color32::from_gray(235));
     }
+    response
 }
 
 /// Fader drawn on exactly the same vertical scale as the meter next to it.
 fn fader_ui(ui: &mut egui::Ui, db: &mut f32, m: &mut Meter, h: f32) {
     ui.horizontal(|ui| {
-        meter_ui(ui, m, h);
+        // Double-clicking the meter also puts the fader back to 0 dB.
+        if meter_ui(ui, m, h).double_clicked() {
+            *db = 0.0;
+        }
         let (rect, r) = ui.allocate_exact_size(egui::vec2(26.0, h), egui::Sense::click_and_drag());
         let r = r.on_hover_text("Drag to set the level. Double-click: 0 dB");
         if r.double_clicked() {

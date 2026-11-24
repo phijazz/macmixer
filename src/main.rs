@@ -17,6 +17,9 @@ const MIN_DB: f32 = -70.0;
 const MAX_DB: f32 = 6.0;
 const BUFFER_CHOICES: [u32; 7] = [32, 64, 128, 256, 512, 1024, 2048];
 const MAX_BUSES: usize = 32;
+const VDEV_RATES: [u32; 6] = [44_100, 48_000, 88_200, 96_000, 176_400, 192_000];
+/// Window height minus fader height: top bar, plus what a channel shows around its fader.
+const STRIP_OVERHEAD: f32 = 246.0;
 
 #[derive(Serialize, Deserialize, Clone, PartialEq, Default)]
 enum SourceCfg {
@@ -79,6 +82,10 @@ struct BusCfg {
     vslot: Option<usize>,
 }
 
+fn default_vdev_rate() -> u32 {
+    48_000
+}
+
 fn five() -> f32 {
     5.0
 }
@@ -92,6 +99,9 @@ struct Config {
     peak_auto: bool,
     #[serde(default = "five")]
     peak_secs: f32,
+    /// Sample rate given to a virtual device when it is created.
+    #[serde(default = "default_vdev_rate")]
+    vdev_rate: u32,
     #[serde(default)]
     buses: Vec<BusCfg>,
     #[serde(default)]
@@ -100,11 +110,19 @@ struct Config {
 
 impl Default for Config {
     fn default() -> Self {
-        Self { buffer: 0, peak_auto: true, peak_secs: 5.0, buses: vec![], strips: vec![] }
+        Self { buffer: 0, peak_auto: true, peak_secs: 5.0, vdev_rate: 48_000, buses: vec![], strips: vec![] }
     }
 }
 
+/// The driver's plug-in object, unless MACMIXER_NO_DRIVER is set (used for UI tests).
+fn find_driver() -> Option<u32> {
+    if std::env::var_os("MACMIXER_NO_DRIVER").is_some() { None } else { vdev::plugin() }
+}
+
 fn config_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("MACMIXER_CONFIG") {
+        return PathBuf::from(p);
+    }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join("Library/Application Support/MacMixer/config.json")
 }
@@ -145,6 +163,12 @@ struct BusUi {
     vrt: Option<Arc<Bus>>,
     vstream: Option<cpal::Stream>,
     verr: String,
+    /// Sample rates the two streams were opened at.
+    rate: u32,
+    vrate: u32,
+    /// The preferred rate has been given to the virtual device (done once; after that
+    /// MacMixer follows whatever rate the device is set to).
+    vrate_set: bool,
     meter: Meter,
 }
 
@@ -156,6 +180,7 @@ enum Action {
     RemoveBus(usize),
     ReopenBus(usize),
     ToggleVirtual(usize),
+    VirtualRate(u32),
     Latency(u32),
 }
 
@@ -169,6 +194,11 @@ struct App {
     peak_secs: f32,
     /// The virtual audio driver's plug-in object, when the driver is installed.
     driver: Option<u32>,
+    vdev_rate: u32,
+    /// MACMIXER_SCREENSHOT=<file.bmp>: save a picture of the window, then quit (UI tests).
+    shot: Option<String>,
+    shot_state: Arc<std::sync::atomic::AtomicU8>,
+    started: Instant,
     last_scan: Instant,
     last_save: Instant,
     saved: String,
@@ -196,7 +226,11 @@ impl App {
             apps: tap::list_apps(),
             peak_auto: cfg.peak_auto,
             peak_secs: cfg.peak_secs.clamp(0.5, 60.0),
-            driver: vdev::plugin(),
+            driver: find_driver(),
+            vdev_rate: if VDEV_RATES.contains(&cfg.vdev_rate) { cfg.vdev_rate } else { 48_000 },
+            shot: std::env::var("MACMIXER_SCREENSHOT").ok(),
+            shot_state: Arc::default(),
+            started: Instant::now(),
             last_scan: Instant::now(),
             last_save: Instant::now(),
             saved: String::new(),
@@ -220,6 +254,7 @@ impl App {
             buffer: BUFFER_FRAMES.load(Relaxed),
             peak_auto: self.peak_auto,
             peak_secs: self.peak_secs,
+            vdev_rate: self.vdev_rate,
             buses: self.buses.iter().map(|b| b.cfg.clone()).collect(),
             strips: self.strips.iter().map(|s| s.cfg.clone()).collect(),
         };
@@ -252,9 +287,10 @@ impl App {
             None => Target::Default,
         };
         match engine::open_output(&target, b.rt.clone()) {
-            Ok((stream, name)) => {
+            Ok((stream, name, rate)) => {
                 b.stream = Some(stream);
                 b.dev_name = name;
+                b.rate = rate;
             }
             Err(e) => {
                 b.dev_name = b.cfg.device.clone().unwrap_or_default();
@@ -273,9 +309,25 @@ impl App {
             b.verr = "driver not installed".into();
             return;
         }
+        // The device appears a moment after it is requested; all of this is retried periodically.
+        let Some(current) = vdev::get_rate(slot) else {
+            b.verr = "virtual device starting…".into();
+            return;
+        };
+        if !b.vrate_set {
+            b.vrate_set = true;
+            if current != self.vdev_rate {
+                // Takes effect asynchronously; the stream is opened on the next retry.
+                vdev::set_rate(slot, self.vdev_rate);
+                b.verr = "virtual device starting…".into();
+                return;
+            }
+        }
         match engine::open_output(&Target::Uid(&vdev::uid(slot)), vrt) {
-            Ok((stream, _)) => b.vstream = Some(stream),
-            // The device appears a moment after it is requested; retried periodically.
+            Ok((stream, _, rate)) => {
+                b.vstream = Some(stream);
+                b.vrate = rate;
+            }
             Err(_) => b.verr = "virtual device starting…".into(),
         }
     }
@@ -309,6 +361,7 @@ impl App {
             let Some(slot) = (0..vdev::MAX_DEVICES).find(|s| !used.contains(s)) else { return };
             let b = &mut self.buses[j];
             b.cfg.vslot = Some(slot);
+            b.vrate_set = false;
             b.vrt = Some(Bus::sharing(b.rt.params.clone(), j));
         }
         self.sync_virtual_devices();
@@ -332,6 +385,9 @@ impl App {
             vrt,
             vstream: None,
             verr: String::new(),
+            rate: 0,
+            vrate: 0,
+            vrate_set: false,
             meter: Meter::default(),
         });
         self.sync_virtual_devices();
@@ -476,13 +532,27 @@ impl App {
                     self.connect(i);
                 }
             }
-            self.driver = vdev::plugin();
+            self.driver = find_driver();
             self.sync_virtual_devices();
             for j in 0..self.buses.len() {
-                if self.buses[j].stream.is_none() && !self.buses[j].cfg.hw_off {
+                // Reopen an output whose device or sample rate changed behind our back
+                // (system default switched, rate changed in Audio MIDI Setup or by another app).
+                let b = &self.buses[j];
+                let hw_stale = !b.cfg.hw_off && {
+                    let target = match &b.cfg.device {
+                        Some(name) => Target::Name(name),
+                        None => Target::Default,
+                    };
+                    b.stream.is_none()
+                        || engine::output_info(&target).is_some_and(|(n, r)| n != b.dev_name || r != b.rate)
+                };
+                let v_stale = b.cfg.vslot.is_some_and(|slot| {
+                    b.vstream.is_none() || vdev::get_rate(slot).is_some_and(|r| r != b.vrate)
+                });
+                if hw_stale {
                     self.open_bus_output(j);
                 }
-                if self.buses[j].vstream.is_none() && self.buses[j].cfg.vslot.is_some() {
+                if v_stale {
                     self.open_virtual(j);
                 }
             }
@@ -621,8 +691,7 @@ fn meter_ui(ui: &mut egui::Ui, m: &Meter, height: f32) {
 }
 
 /// Fader drawn on exactly the same vertical scale as the meter next to it.
-fn fader_ui(ui: &mut egui::Ui, db: &mut f32, m: &mut Meter) {
-    let h = 250.0;
+fn fader_ui(ui: &mut egui::Ui, db: &mut f32, m: &mut Meter, h: f32) {
     ui.horizontal(|ui| {
         meter_ui(ui, m, h);
         let (rect, r) = ui.allocate_exact_size(egui::vec2(26.0, h), egui::Sense::click_and_drag());
@@ -703,6 +772,16 @@ fn source_menu(ui: &mut egui::Ui, in_devs: &[(String, u16)], apps: &[tap::AppInf
     pick
 }
 
+/// Fixed-height area under the source/device menu (option checkbox + status line), so
+/// that the faders of all channels line up whatever each channel shows there.
+fn options_area(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui)) {
+    let size = egui::vec2(ui.available_width(), 34.0);
+    ui.allocate_ui_with_layout(size, egui::Layout::top_down(egui::Align::Min), |ui| {
+        ui.set_min_height(size.y);
+        add(ui);
+    });
+}
+
 fn warn(ui: &mut egui::Ui, text: &str) {
     if !text.is_empty() {
         ui.colored_label(egui::Color32::from_rgb(230, 160, 60), egui::RichText::new(text).small());
@@ -713,6 +792,8 @@ impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.tick();
         let mut action = None;
+        // Channels follow the window height (but keep their width).
+        let fader_h = (ui.available_height() - STRIP_OVERHEAD).max(100.0);
 
         egui::Panel::top("bar").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -736,6 +817,17 @@ impl eframe::App for App {
                         }
                     }
                     ui.separator();
+                    ui.strong("Virtual device sample rate").on_hover_text(
+                        "Rate given to a virtual device when it is created.\n\
+                         It can still be changed afterwards by other applications\n\
+                         or in Audio MIDI Setup; MacMixer follows.",
+                    );
+                    for r in VDEV_RATES {
+                        if ui.radio(r == self.vdev_rate, format!("{:.1} kHz", r as f32 / 1000.0)).clicked() && r != self.vdev_rate {
+                            action = Some(Action::VirtualRate(r));
+                        }
+                    }
+                    ui.separator();
                     ui.strong("Peak values");
                     ui.checkbox(&mut self.peak_auto, "Auto-reset");
                     ui.add_enabled(
@@ -746,9 +838,12 @@ impl eframe::App for App {
             });
         });
 
-        egui::Panel::right("buses").show(ui, |ui| {
+        // The outputs panel is as wide as its channels, up to 60% of the window.
+        let outputs_width = (self.buses.len() as f32 * 133.0 + 8.0).min(ui.available_width() * 0.6);
+        egui::Panel::right("buses").resizable(false).exact_size(outputs_width).show(ui, |ui| {
             let n_buses = self.buses.len();
             let driver_ok = self.driver.is_some();
+            ui.add_space(6.0); // same top margin as the input channels
             egui::ScrollArea::horizontal().id_salt("bus_scroll").show(ui, |ui| {
                 ui.horizontal_top(|ui| {
                     for (j, b) in self.buses.iter_mut().enumerate() {
@@ -789,21 +884,22 @@ impl eframe::App for App {
                                             }
                                         }
                                     });
-                                    let mut virt = b.cfg.vslot.is_some();
-                                    let r = ui
-                                        .add_enabled(driver_ok || virt, egui::Checkbox::new(&mut virt, "Virtual device"))
-                                        .on_hover_text(format!(
-                                            "Publishes this output as an audio device named “{VIRTUAL_PREFIX}{}”,\n\
-                                             which other applications can select as their input.",
-                                            b.cfg.name
-                                        ))
-                                        .on_disabled_hover_text("The MacMixer audio driver is not installed. Run ./install.sh to install it.");
-                                    if r.changed() {
-                                        action = Some(Action::ToggleVirtual(j));
-                                    }
-                                    warn(ui, &b.err);
-                                    warn(ui, &b.verr);
-                                    fader_ui(ui, &mut b.cfg.db, &mut b.meter);
+                                    options_area(ui, |ui| {
+                                        let mut virt = b.cfg.vslot.is_some();
+                                        let r = ui
+                                            .add_enabled(driver_ok || virt, egui::Checkbox::new(&mut virt, "Virtual device"))
+                                            .on_hover_text(format!(
+                                                "Publishes this output as an audio device named “{VIRTUAL_PREFIX}{}”,\n\
+                                                 which other applications can select as their input.",
+                                                b.cfg.name
+                                            ))
+                                            .on_disabled_hover_text("The MacMixer audio driver is not installed. Run ./install.sh to install it.");
+                                        if r.changed() {
+                                            action = Some(Action::ToggleVirtual(j));
+                                        }
+                                        warn(ui, if b.err.is_empty() { &b.verr } else { &b.err });
+                                    });
+                                    fader_ui(ui, &mut b.cfg.db, &mut b.meter, fader_h);
                                     ui.add_space(22.0);
                                     ui.horizontal(|ui| {
                                         ui.toggle_value(&mut b.cfg.mute, "M").on_hover_text("Mute");
@@ -845,23 +941,21 @@ impl eframe::App for App {
                                         s.cfg.source = src;
                                         action = Some(Action::Reconnect(i));
                                     }
-                                    if matches!(s.cfg.source, SourceCfg::App { .. })
-                                        && ui
-                                            .checkbox(&mut s.cfg.mute_direct, "Exclusive")
-                                            .on_hover_text(
-                                                "Silences the app's own output: it is only heard through the mixer.\n\
-                                                 Unchecked: the app also keeps playing on its usual output.",
-                                            )
-                                            .changed()
-                                    {
-                                        action = Some(Action::Reconnect(i));
-                                    }
-                                    if !matches!(s.cfg.source, SourceCfg::App { .. }) {
-                                        // Keeps the faders of all channels on the same line.
-                                        ui.allocate_exact_size(egui::vec2(1.0, ui.spacing().interact_size.y), egui::Sense::hover());
-                                    }
-                                    warn(ui, &s.status);
-                                    fader_ui(ui, &mut s.cfg.db, &mut s.meter);
+                                    options_area(ui, |ui| {
+                                        if matches!(s.cfg.source, SourceCfg::App { .. })
+                                            && ui
+                                                .checkbox(&mut s.cfg.mute_direct, "Exclusive")
+                                                .on_hover_text(
+                                                    "Silences the app's own output: it is only heard through the mixer.\n\
+                                                     Unchecked: the app also keeps playing on its usual output.",
+                                                )
+                                                .changed()
+                                        {
+                                            action = Some(Action::Reconnect(i));
+                                        }
+                                        warn(ui, &s.status);
+                                    });
+                                    fader_ui(ui, &mut s.cfg.db, &mut s.meter, fader_h);
                                     ui.scope(|ui| {
                                         ui.spacing_mut().slider_width = 100.0;
                                         let r = ui
@@ -925,8 +1019,31 @@ impl eframe::App for App {
                 self.reconnect_all();
             }
             Some(Action::ToggleVirtual(j)) => self.toggle_virtual(j),
+            Some(Action::VirtualRate(r)) => {
+                self.vdev_rate = r;
+                for j in 0..self.buses.len() {
+                    self.buses[j].vrate_set = false;
+                    self.open_virtual(j);
+                }
+            }
             Some(Action::Latency(f)) => self.set_latency(f),
             None => {}
+        }
+        if let Some(path) = self.shot.clone() {
+            match self.shot_state.load(Relaxed) {
+                0 if self.started.elapsed() > Duration::from_secs(3) => {
+                    self.shot_state.store(1, Relaxed);
+                    let state = self.shot_state.clone();
+                    ui.ctx().send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::ScreenshotCallback::new(
+                        move |img| {
+                            write_bmp(&path, &img);
+                            state.store(2, Relaxed);
+                        },
+                    )));
+                }
+                2 => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                _ => {}
+            }
         }
         ui.ctx().request_repaint_after(Duration::from_millis(33));
     }
@@ -945,9 +1062,48 @@ impl Drop for App {
     }
 }
 
+/// Minimal 24-bit BMP writer (for MACMIXER_SCREENSHOT).
+fn write_bmp(path: &str, img: &egui::ColorImage) {
+    let [w, h] = img.size;
+    let row = (w * 3).div_ceil(4) * 4;
+    let mut out = Vec::with_capacity(54 + row * h);
+    out.extend(b"BM");
+    out.extend(((54 + row * h) as u32).to_le_bytes());
+    out.extend([0u8; 4]);
+    out.extend(54u32.to_le_bytes());
+    out.extend(40u32.to_le_bytes());
+    out.extend((w as i32).to_le_bytes());
+    out.extend((h as i32).to_le_bytes());
+    out.extend(1u16.to_le_bytes());
+    out.extend(24u16.to_le_bytes());
+    out.extend([0u8; 24]);
+    let raw = img.as_raw();
+    for y in (0..h).rev() {
+        let line = &raw[y * w * 4..(y + 1) * w * 4];
+        for px in line.chunks_exact(4) {
+            out.extend([px[2], px[1], px[0]]);
+        }
+        out.resize(out.len() + row - w * 3, 0);
+    }
+    let _ = std::fs::write(path, out);
+}
+
 fn main() -> eframe::Result {
+    if std::env::args().any(|a| a == "--driver-status") {
+        match vdev::plugin() {
+            Some(id) => {
+                println!("driver loaded (plug-in object {id})");
+                let names = vdev::get_names(id).unwrap_or_default();
+                for (slot, name) in names.lines().enumerate().filter(|(_, n)| !n.is_empty()) {
+                    println!("  slot {slot}: {name} @ {:?} Hz", vdev::get_rate(slot));
+                }
+            }
+            None => println!("driver not loaded"),
+        }
+        return Ok(());
+    }
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_title("MacMixer").with_inner_size([900.0, 500.0]),
+        viewport: egui::ViewportBuilder::default().with_title("MacMixer").with_inner_size([900.0, 500.0]).with_min_inner_size([420.0, 340.0]),
         ..Default::default()
     };
     eframe::run_native("MacMixer", options, Box::new(|_cc| Ok(Box::new(App::new()))))

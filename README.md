@@ -17,9 +17,12 @@ audio driver required.
   Every input channel can be sent to any combination of outputs.
 - **Virtual devices**: with "Virtual device" ticked, an output channel is also published
   as an audio device named "MacMixer: <output name>" that any other application can
-  select as its input (48 kHz stereo). This uses MacMixer's own small audio driver;
-  the devices exist only while MacMixer is running.
-- **Settings**: latency (device buffer size) and peak auto-reset time.
+  select as its input. This uses MacMixer's own small audio driver; the devices exist
+  only while MacMixer is running. They are stereo, 44.1 to 192 kHz: the rate can be set
+  in MacMixer's settings, in Audio MIDI Setup or by the application using the device.
+- **Settings**: latency (device buffer size), virtual device sample rate and peak
+  auto-reset time.
+- Channels grow with the window height.
 - The whole setup is saved automatically to
   `~/Library/Application Support/MacMixer/config.json`.
 
@@ -58,7 +61,7 @@ To uninstall the application and the driver: `./uninstall.sh`.
 ## Not there yet
 
 - MIDI control, pre-fader metering.
-- Virtual devices are fixed at 48 kHz stereo.
+- Virtual devices are stereo only.
 
 ## License
 

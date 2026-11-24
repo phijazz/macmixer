@@ -340,19 +340,29 @@ pub fn open_device_input(
     Err(err)
 }
 
-/// Opens an output sink. Returns the stream and the actual device name.
-pub fn open_output(target: &Target, bus: Arc<Bus>) -> Result<(cpal::Stream, String), String> {
+fn find_output(target: &Target) -> Result<cpal::Device, String> {
     let host = cpal::default_host();
     let mut devs = host.output_devices().map_err(|e| e.to_string())?;
-    let dev = match target {
-        Target::Default => host.default_output_device().ok_or_else(|| "no audio output".to_string())?,
+    match target {
+        Target::Default => host.default_output_device().ok_or_else(|| "no audio output".to_string()),
         Target::Name(n) => {
-            devs.find(|d| dev_name(d).as_deref() == Some(*n)).ok_or_else(|| "device not found".to_string())?
+            devs.find(|d| dev_name(d).as_deref() == Some(*n)).ok_or_else(|| "device not found".to_string())
         }
-        Target::Uid(u) => devs
-            .find(|d| d.id().is_ok_and(|id| id.id() == *u))
-            .ok_or_else(|| "device not found".to_string())?,
-    };
+        Target::Uid(u) => {
+            devs.find(|d| d.id().is_ok_and(|id| id.id() == *u)).ok_or_else(|| "device not found".to_string())
+        }
+    }
+}
+
+/// Current (device name, sample rate) of a target, to notice when either changes.
+pub fn output_info(target: &Target) -> Option<(String, u32)> {
+    let dev = find_output(target).ok()?;
+    Some((dev_name(&dev)?, dev.default_output_config().ok()?.sample_rate()))
+}
+
+/// Opens an output sink. Returns the stream, the actual device name and its sample rate.
+pub fn open_output(target: &Target, bus: Arc<Bus>) -> Result<(cpal::Stream, String, u32), String> {
+    let dev = find_output(target)?;
     let cfg = dev.default_output_config().map_err(|e| e.to_string())?;
     let ch = cfg.channels() as usize;
     let rate = cfg.sample_rate() as f64;
@@ -368,7 +378,7 @@ pub fn open_output(target: &Target, bus: Arc<Bus>) -> Result<(cpal::Stream, Stri
         match res {
             Ok(stream) => {
                 stream.play().map_err(|e| e.to_string())?;
-                return Ok((stream, dev_name(&dev).unwrap_or_default()));
+                return Ok((stream, dev_name(&dev).unwrap_or_default(), rate as u32));
             }
             Err(e) => err = e.to_string(),
         }

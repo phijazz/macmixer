@@ -30,7 +30,10 @@ const fn fourcc(s: &[u8; 4]) -> u32 {
 pub const MAX_DEVICES: usize = 16;
 /// Custom plug-in property (CFString): device names, one line per slot.
 pub const PROP_DEVICE_NAMES: u32 = fourcc(b"mmxd");
-pub const SAMPLE_RATE: f64 = 48_000.0;
+pub const DEFAULT_RATE: f64 = 48_000.0;
+/// Sample rates every device supports. The rate is per device and can be changed by any
+/// client (Audio MIDI Setup, a DAW, MacMixer itself).
+pub const RATES: [f64; 6] = [44_100.0, 48_000.0, 88_200.0, 96_000.0, 176_400.0, 192_000.0];
 const CHANNELS: usize = 2;
 /// Ring buffer length in frames; also the zero-timestamp period.
 const RING: usize = 16_384;
@@ -57,6 +60,7 @@ const ERR_BAD_OBJECT: OSStatus = fourcc(b"!obj") as i32;
 const ERR_BAD_SIZE: OSStatus = fourcc(b"!siz") as i32;
 const ERR_ILLEGAL: OSStatus = fourcc(b"nope") as i32;
 const ERR_UNSUPPORTED: OSStatus = fourcc(b"unop") as i32;
+const ERR_UNSUPPORTED_FORMAT: OSStatus = fourcc(b"!dat") as i32;
 
 // Property selectors, scopes and classes (four-character codes from the CoreAudio headers).
 const SCOPE_INPUT: u32 = fourcc(b"inpt");
@@ -136,7 +140,9 @@ pub struct HostInterface {
     pub CopyFromStorage: *const c_void,
     pub WriteToStorage: *const c_void,
     pub DeleteFromStorage: *const c_void,
-    pub RequestDeviceConfigurationChange: *const c_void,
+    pub RequestDeviceConfigurationChange: Option<
+        unsafe extern "C" fn(host: *const HostInterface, device: ObjectID, action: u64, info: *mut c_void) -> OSStatus,
+    >,
 }
 
 static HOST: AtomicPtr<HostInterface> = AtomicPtr::new(std::ptr::null_mut());
@@ -147,10 +153,24 @@ struct Clock {
     io_count: AtomicU32,
     anchor_host_time: AtomicU64,
     periods: AtomicU64,
+    /// Sample time just past the most recent output write: nothing at or after it is valid.
+    write_end: AtomicU64,
 }
 static CLOCKS: [Clock; MAX_DEVICES] = [const {
-    Clock { io_count: AtomicU32::new(0), anchor_host_time: AtomicU64::new(0), periods: AtomicU64::new(0) }
+    Clock {
+        io_count: AtomicU32::new(0),
+        anchor_host_time: AtomicU64::new(0),
+        periods: AtomicU64::new(0),
+        write_end: AtomicU64::new(0),
+    }
 }; MAX_DEVICES];
+
+/// Current sample rate per slot (f64 bits).
+static RATE_BITS: [AtomicU64; MAX_DEVICES] = [const { AtomicU64::new(DEFAULT_RATE.to_bits()) }; MAX_DEVICES];
+
+fn rate(slot: usize) -> f64 {
+    f64::from_bits(RATE_BITS[slot].load(Ordering::Relaxed))
+}
 
 /// Loopback storage for one device. Only touched from that device's IO thread.
 struct Ring(UnsafeCell<Box<[f32]>>);
@@ -174,13 +194,12 @@ unsafe extern "C" {
     fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
 }
 
-fn host_ticks_per_frame() -> f64 {
+fn host_ticks_per_second() -> f64 {
     static TICKS: OnceLock<f64> = OnceLock::new();
     *TICKS.get_or_init(|| {
         let mut tb = MachTimebaseInfo { numer: 0, denom: 0 };
         unsafe { mach_timebase_info(&mut tb) };
-        let ticks_per_second = 1e9 * tb.denom as f64 / tb.numer as f64;
-        ticks_per_second / SAMPLE_RATE
+        1e9 * tb.denom as f64 / tb.numer as f64
     })
 }
 
@@ -249,10 +268,10 @@ fn v_str(s: &str) -> Value {
     Value::Str(s.to_string())
 }
 
-/// AudioStreamBasicDescription: 48 kHz, stereo, interleaved native-endian packed Float32.
-fn format_bytes() -> Vec<u8> {
+/// AudioStreamBasicDescription: stereo, interleaved native-endian packed Float32.
+fn format_bytes(rate: f64) -> Vec<u8> {
     let mut b = Vec::with_capacity(40);
-    b.extend(SAMPLE_RATE.to_ne_bytes());
+    b.extend(rate.to_ne_bytes());
     b.extend(fourcc(b"lpcm").to_ne_bytes());
     b.extend((1u32 | 8).to_ne_bytes()); // float | packed
     b.extend((4 * CHANNELS as u32).to_ne_bytes()); // bytes per packet
@@ -264,12 +283,26 @@ fn format_bytes() -> Vec<u8> {
     b
 }
 
-/// AudioStreamRangedDescription for the single supported format.
+/// AudioStreamRangedDescription list: the same format at every supported rate.
 fn ranged_format_bytes() -> Vec<u8> {
-    let mut b = format_bytes();
-    b.extend(SAMPLE_RATE.to_ne_bytes());
-    b.extend(SAMPLE_RATE.to_ne_bytes());
+    let mut b = Vec::new();
+    for r in RATES {
+        b.extend(format_bytes(r));
+        b.extend(r.to_ne_bytes());
+        b.extend(r.to_ne_bytes());
+    }
     b
+}
+
+/// Sample rate requested by an AudioStreamBasicDescription, if it is a format we support.
+fn rate_of_format(b: &[u8]) -> Option<f64> {
+    if b.len() != 40 {
+        return None;
+    }
+    let u32_at = |o: usize| u32::from_ne_bytes(b[o..o + 4].try_into().unwrap());
+    let r = f64::from_ne_bytes(b[..8].try_into().unwrap());
+    (u32_at(8) == fourcc(b"lpcm") && u32_at(28) == CHANNELS as u32 && u32_at(32) == 32 && RATES.contains(&r))
+        .then_some(r)
 }
 
 unsafe fn qualifier_string(size: u32, data: *const c_void) -> Option<String> {
@@ -335,11 +368,10 @@ unsafe fn get_property(
             P_DEV_CAN_BE_SYSTEM_DEFAULT => v_u32(0),
             P_LATENCY | P_DEV_SAFETY_OFFSET => v_u32(0),
             P_CONTROL_LIST => v_u32s(&[]),
-            P_DEV_SAMPLE_RATE => v_f64(SAMPLE_RATE),
+            P_DEV_SAMPLE_RATE => v_f64(rate(slot)),
             P_DEV_AVAILABLE_RATES => {
-                let mut b = SAMPLE_RATE.to_ne_bytes().to_vec();
-                b.extend(SAMPLE_RATE.to_ne_bytes());
-                Value::Bytes(b)
+                // AudioValueRange list, one discrete rate each.
+                Value::Bytes(RATES.iter().flat_map(|r| [r.to_ne_bytes(), r.to_ne_bytes()]).flatten().collect())
             }
             P_DEV_HIDDEN => v_u32(0),
             P_DEV_STEREO_CHANNELS => v_u32s(&[1, 2]),
@@ -359,7 +391,7 @@ unsafe fn get_property(
             P_STREAM_TERMINAL => v_u32(if is_input { TERMINAL_MICROPHONE } else { TERMINAL_SPEAKER }),
             P_STREAM_START_CHANNEL => v_u32(1),
             P_LATENCY => v_u32(0),
-            P_STREAM_VIRTUAL_FORMAT | P_STREAM_PHYSICAL_FORMAT => Value::Bytes(format_bytes()),
+            P_STREAM_VIRTUAL_FORMAT | P_STREAM_PHYSICAL_FORMAT => Value::Bytes(format_bytes(rate(slot))),
             P_STREAM_AVAILABLE_VIRTUAL | P_STREAM_AVAILABLE_PHYSICAL => Value::Bytes(ranged_format_bytes()),
             _ => return Err(ERR_UNKNOWN_PROPERTY),
         },
@@ -407,6 +439,34 @@ fn set_device_names(text: &str) {
     for slot in renamed {
         notify(device_id(slot), &[P_NAME]);
     }
+}
+
+/// Changing the sample rate must go through the host: it stops IO, calls
+/// `PerformDeviceConfigurationChange`, then restarts everything.
+fn request_rate_change(slot: usize, new_rate: f64) {
+    if new_rate == rate(slot) {
+        return;
+    }
+    let host = HOST.load(Ordering::Acquire);
+    let request = if host.is_null() { None } else { unsafe { (*host).RequestDeviceConfigurationChange } };
+    match request {
+        Some(request) => {
+            let host = host as usize;
+            // The host may call back synchronously, so never from the property call itself.
+            std::thread::spawn(move || unsafe {
+                request(host as *const HostInterface, device_id(slot), new_rate as u64, std::ptr::null_mut());
+            });
+        }
+        None => apply_rate(slot, new_rate),
+    }
+}
+
+fn apply_rate(slot: usize, new_rate: f64) {
+    RATE_BITS[slot].store(new_rate.to_bits(), Ordering::Relaxed);
+    let c = &CLOCKS[slot];
+    c.periods.store(0, Ordering::Relaxed);
+    c.write_end.store(0, Ordering::Relaxed);
+    c.anchor_host_time.store(unsafe { mach_absolute_time() }, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------------------
@@ -487,8 +547,8 @@ pub static INTERFACE: DriverInterface = DriverInterface {
     DestroyDevice: destroy_device,
     AddDeviceClient: device_client,
     RemoveDeviceClient: device_client,
-    PerformDeviceConfigurationChange: configuration_change,
-    AbortDeviceConfigurationChange: configuration_change,
+    PerformDeviceConfigurationChange: perform_configuration_change,
+    AbortDeviceConfigurationChange: abort_configuration_change,
     HasProperty: has_property,
     IsPropertySettable: is_property_settable,
     GetPropertyDataSize: get_property_data_size,
@@ -581,7 +641,7 @@ unsafe extern "C" fn release(_d: Ref) -> u32 {
 unsafe extern "C" fn initialize(_d: Ref, host: *const HostInterface) -> OSStatus {
     HOST.store(host as *mut HostInterface, Ordering::Release);
     rings();
-    host_ticks_per_frame();
+    host_ticks_per_second();
     0
 }
 
@@ -594,7 +654,17 @@ unsafe extern "C" fn destroy_device(_d: Ref, _device: ObjectID) -> OSStatus {
 unsafe extern "C" fn device_client(_d: Ref, _device: ObjectID, _client: *const c_void) -> OSStatus {
     0
 }
-unsafe extern "C" fn configuration_change(_d: Ref, _device: ObjectID, _action: u64, _info: *mut c_void) -> OSStatus {
+unsafe extern "C" fn perform_configuration_change(_d: Ref, device: ObjectID, action: u64, _info: *mut c_void) -> OSStatus {
+    let Some(slot) = slot_of_device(device) else { return ERR_BAD_OBJECT };
+    // The change action carries the new sample rate.
+    let new_rate = action as f64;
+    if !RATES.contains(&new_rate) {
+        return ERR_UNSUPPORTED_FORMAT;
+    }
+    apply_rate(slot, new_rate);
+    0
+}
+unsafe extern "C" fn abort_configuration_change(_d: Ref, _device: ObjectID, _action: u64, _info: *mut c_void) -> OSStatus {
     0
 }
 
@@ -612,7 +682,13 @@ unsafe extern "C" fn is_property_settable(_d: Ref, id: ObjectID, _pid: libc::pid
     if let Err(e) = get_property(id, &*addr, 0, std::ptr::null()) {
         return e;
     }
-    *out = (id == PLUGIN_ID && (*addr).mSelector == PROP_DEVICE_NAMES) as u8;
+    let sel = (*addr).mSelector;
+    *out = match classify(id) {
+        Some(Object::PlugIn) => sel == PROP_DEVICE_NAMES,
+        Some(Object::Device(_)) => sel == P_DEV_SAMPLE_RATE,
+        Some(Object::Stream(..)) => sel == P_STREAM_VIRTUAL_FORMAT || sel == P_STREAM_PHYSICAL_FORMAT,
+        None => false,
+    } as u8;
     0
 }
 
@@ -684,10 +760,33 @@ unsafe extern "C" fn set_property_data(
     if addr.is_null() {
         return ERR_ILLEGAL;
     }
-    if classify(id).is_none() {
-        return ERR_BAD_OBJECT;
+    let Some(obj) = classify(id) else { return ERR_BAD_OBJECT };
+    let sel = (*addr).mSelector;
+    match obj {
+        Object::Device(slot) if sel == P_DEV_SAMPLE_RATE => {
+            if in_size != 8 || data.is_null() {
+                return ERR_BAD_SIZE;
+            }
+            let new_rate = *(data as *const f64);
+            if !RATES.contains(&new_rate) {
+                return ERR_UNSUPPORTED_FORMAT;
+            }
+            request_rate_change(slot, new_rate);
+            return 0;
+        }
+        Object::Stream(slot, _) if sel == P_STREAM_VIRTUAL_FORMAT || sel == P_STREAM_PHYSICAL_FORMAT => {
+            if in_size != 40 || data.is_null() {
+                return ERR_BAD_SIZE;
+            }
+            let Some(new_rate) = rate_of_format(std::slice::from_raw_parts(data as *const u8, 40)) else {
+                return ERR_UNSUPPORTED_FORMAT;
+            };
+            request_rate_change(slot, new_rate);
+            return 0;
+        }
+        _ => {}
     }
-    if id == PLUGIN_ID && (*addr).mSelector == PROP_DEVICE_NAMES {
+    if id == PLUGIN_ID && sel == PROP_DEVICE_NAMES {
         if in_size as usize != size_of::<*const CFString>() || data.is_null() {
             return ERR_BAD_SIZE;
         }
@@ -707,6 +806,7 @@ unsafe extern "C" fn start_io(_d: Ref, device: ObjectID, _client: u32) -> OSStat
     let c = &CLOCKS[slot];
     if c.io_count.fetch_add(1, Ordering::AcqRel) == 0 {
         c.periods.store(0, Ordering::Relaxed);
+        c.write_end.store(0, Ordering::Relaxed);
         c.anchor_host_time.store(mach_absolute_time(), Ordering::Relaxed);
         // Start from silence. No IO thread is running for this device yet.
         (*rings()[slot].0.get()).fill(0.0);
@@ -731,7 +831,7 @@ unsafe extern "C" fn get_zero_time_stamp(
 ) -> OSStatus {
     let Some(slot) = slot_of_device(device) else { return ERR_BAD_OBJECT };
     let c = &CLOCKS[slot];
-    let ticks_per_period = host_ticks_per_frame() * RING as f64;
+    let ticks_per_period = host_ticks_per_second() / rate(slot) * RING as f64;
     let anchor = c.anchor_host_time.load(Ordering::Relaxed);
     let mut periods = c.periods.load(Ordering::Relaxed);
     let now = mach_absolute_time();
@@ -792,21 +892,39 @@ unsafe extern "C" fn do_io_operation(
     }
     let ring = &mut *rings()[slot].0.get();
     let buf = std::slice::from_raw_parts_mut(main_buffer as *mut f32, frames as usize * CHANNELS);
+    let clock = &CLOCKS[slot];
+    let n = frames as u64;
     match operation {
         OP_WRITE_MIX => {
-            let start = ((*info).mOutputTime.mSampleTime as i64).rem_euclid(RING as i64) as usize;
+            let start = (*info).mOutputTime.mSampleTime.max(0.0) as u64;
+            // If the writer skipped ahead, silence the gap so old audio is never replayed.
+            let prev_end = clock.write_end.load(Ordering::Relaxed);
+            if start > prev_end {
+                for t in prev_end.max(start.saturating_sub(RING as u64))..start {
+                    let i = (t % RING as u64) as usize * CHANNELS;
+                    ring[i..i + CHANNELS].fill(0.0);
+                }
+            }
             for (f, frame) in buf.chunks_exact(CHANNELS).enumerate() {
-                let i = ((start + f) % RING) * CHANNELS;
+                let i = ((start + f as u64) % RING as u64) as usize * CHANNELS;
                 ring[i..i + CHANNELS].copy_from_slice(frame);
             }
+            clock.write_end.store(start + n, Ordering::Relaxed);
         }
         OP_READ_INPUT => {
-            let start = ((*info).mInputTime.mSampleTime as i64).rem_euclid(RING as i64) as usize;
+            let start = (*info).mInputTime.mSampleTime.max(0.0) as u64;
+            // Only what was written within the last ring length is valid; the rest is
+            // silence (nothing playing, or the writer stopped).
+            let end = clock.write_end.load(Ordering::Relaxed);
+            let oldest = end.saturating_sub(RING as u64);
             for (f, frame) in buf.chunks_exact_mut(CHANNELS).enumerate() {
-                let i = ((start + f) % RING) * CHANNELS;
-                frame.copy_from_slice(&ring[i..i + CHANNELS]);
-                // Consumed: clear it so stale audio never loops if the writer stops.
-                ring[i..i + CHANNELS].fill(0.0);
+                let t = start + f as u64;
+                if t >= oldest && t < end {
+                    let i = (t % RING as u64) as usize * CHANNELS;
+                    frame.copy_from_slice(&ring[i..i + CHANNELS]);
+                } else {
+                    frame.fill(0.0);
+                }
             }
         }
         _ => {}
@@ -883,7 +1001,7 @@ mod tests {
                 CopyFromStorage: std::ptr::null(),
                 WriteToStorage: std::ptr::null(),
                 DeleteFromStorage: std::ptr::null(),
-                RequestDeviceConfigurationChange: std::ptr::null(),
+                RequestDeviceConfigurationChange: None,
             };
 
             // COM plumbing.
@@ -930,14 +1048,34 @@ mod tests {
             assert_eq!(get_u32s(output_stream_id(0), P_STREAM_DIRECTION), vec![0]);
             let fmt = get_bytes(input_stream_id(0), P_STREAM_VIRTUAL_FORMAT).unwrap();
             assert_eq!(fmt.len(), 40);
-            assert_eq!(f64::from_ne_bytes(fmt[..8].try_into().unwrap()), SAMPLE_RATE);
-            assert_eq!(get_bytes(input_stream_id(0), P_STREAM_AVAILABLE_VIRTUAL).unwrap().len(), 56);
+            assert_eq!(f64::from_ne_bytes(fmt[..8].try_into().unwrap()), DEFAULT_RATE);
+            assert_eq!(get_bytes(input_stream_id(0), P_STREAM_AVAILABLE_VIRTUAL).unwrap().len(), 56 * RATES.len());
+            assert_eq!(get_bytes(device_id(0), P_DEV_AVAILABLE_RATES).unwrap().len(), 16 * RATES.len());
             assert_eq!(get_bytes(device_id(0), fourcc(b"xxxx")), Err(ERR_UNKNOWN_PROPERTY));
             let mut settable = 9u8;
             assert_eq!((INTERFACE.IsPropertySettable)(d, PLUGIN_ID, 0, &addr(PROP_DEVICE_NAMES), &mut settable), 0);
             assert_eq!(settable, 1);
             assert_eq!((INTERFACE.IsPropertySettable)(d, device_id(0), 0, &addr(P_DEV_SAMPLE_RATE), &mut settable), 0);
+            assert_eq!(settable, 1);
+            assert_eq!((INTERFACE.IsPropertySettable)(d, device_id(0), 0, &addr(P_DEV_UID), &mut settable), 0);
             assert_eq!(settable, 0);
+
+            // Sample rate: per device, changed through the rate or the stream format.
+            let set = |id: ObjectID, sel: u32, bytes: &[u8]| {
+                (INTERFACE.SetPropertyData)(d, id, 0, &addr(sel), 0, std::ptr::null(), bytes.len() as u32, bytes.as_ptr().cast())
+            };
+            let rate_of = |id: ObjectID| f64::from_ne_bytes(get_bytes(id, P_DEV_SAMPLE_RATE).unwrap().try_into().unwrap());
+            assert_eq!(set(device_id(0), P_DEV_SAMPLE_RATE, &96_000f64.to_ne_bytes()), 0);
+            assert_eq!(rate_of(device_id(0)), 96_000.0);
+            assert_eq!(rate_of(device_id(2)), DEFAULT_RATE);
+            let fmt = get_bytes(output_stream_id(0), P_STREAM_PHYSICAL_FORMAT).unwrap();
+            assert_eq!(f64::from_ne_bytes(fmt[..8].try_into().unwrap()), 96_000.0);
+            assert_eq!(set(device_id(0), P_DEV_SAMPLE_RATE, &12_345f64.to_ne_bytes()), ERR_UNSUPPORTED_FORMAT);
+            assert_eq!(set(input_stream_id(0), P_STREAM_VIRTUAL_FORMAT, &format_bytes(44_100.0)), 0);
+            assert_eq!(rate_of(device_id(0)), 44_100.0);
+            // The host applies a requested change through PerformDeviceConfigurationChange.
+            assert_eq!((INTERFACE.PerformDeviceConfigurationChange)(d, device_id(0), 48_000, std::ptr::null_mut()), 0);
+            assert_eq!(rate_of(device_id(0)), DEFAULT_RATE);
 
             // Rename only: one more notification, same device list.
             assert_eq!(set_names("MacMixer: Main\n\nMacMixer: Live"), 0);
@@ -953,8 +1091,8 @@ mod tests {
             assert_eq!((st, seed), (0.0, 1));
             assert!(ht > 0);
 
-            // Loopback: what is written at a sample time is read back at that time, once.
-            // The range wraps around the end of the ring.
+            // Loopback: what is written at a sample time is read back at that time, by any
+            // number of readers. The range wraps around the end of the ring.
             let t = (RING * 3 - 100) as f64;
             let frames = 256u32;
             let mut out_buf: Vec<f32> = (0..frames * 2).map(|i| i as f32 + 1.0).collect();
@@ -967,12 +1105,25 @@ mod tests {
             let info = cycle(t, 0.0);
             (INTERFACE.DoIOOperation)(d, device_id(0), input_stream_id(0), 1, OP_READ_INPUT, frames, &info, in_buf.as_mut_ptr().cast(), std::ptr::null_mut());
             assert_eq!(in_buf, out_buf);
+            in_buf.fill(9.0);
+            (INTERFACE.DoIOOperation)(d, device_id(0), input_stream_id(0), 1, OP_READ_INPUT, frames, &info, in_buf.as_mut_ptr().cast(), std::ptr::null_mut());
+            assert_eq!(in_buf, out_buf);
+            // Past the last write there is only silence, never old audio from a lap ago...
+            let info = cycle(t + RING as f64, 0.0);
+            (INTERFACE.DoIOOperation)(d, device_id(0), input_stream_id(0), 1, OP_READ_INPUT, frames, &info, in_buf.as_mut_ptr().cast(), std::ptr::null_mut());
+            assert!(in_buf.iter().all(|&x| x == 0.0));
+            // ...and a gap left by the writer is silent too.
+            let t2 = t + 1000.0;
+            let info = cycle(0.0, t2);
+            (INTERFACE.DoIOOperation)(d, device_id(0), output_stream_id(0), 1, OP_WRITE_MIX, frames, &info, out_buf.as_mut_ptr().cast(), std::ptr::null_mut());
+            let info = cycle(t2 - 256.0, 0.0);
             (INTERFACE.DoIOOperation)(d, device_id(0), input_stream_id(0), 1, OP_READ_INPUT, frames, &info, in_buf.as_mut_ptr().cast(), std::ptr::null_mut());
             assert!(in_buf.iter().all(|&x| x == 0.0));
 
             // Devices are independent.
-            let info = cycle(0.0, 0.0);
+            let info = cycle(0.0, t2);
             (INTERFACE.DoIOOperation)(d, device_id(0), output_stream_id(0), 1, OP_WRITE_MIX, frames, &info, out_buf.as_mut_ptr().cast(), std::ptr::null_mut());
+            let info = cycle(t2, 0.0);
             (INTERFACE.DoIOOperation)(d, device_id(2), input_stream_id(2), 1, OP_READ_INPUT, frames, &info, in_buf.as_mut_ptr().cast(), std::ptr::null_mut());
             assert!(in_buf.iter().all(|&x| x == 0.0));
 
